@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -157,7 +158,7 @@ HAND_MODEL = "rtmpose-m-hand5"
 #
 # Same call as vop's `classes` config, which was removed rather than left
 # available-but-broken.
-ACTION_BACKENDS = ("hybrid", "rules")
+ACTION_BACKENDS = ("hybrid", "rules", "official126")
 
 # Cards saved before `stgcn` was withdrawn. Migrated rather than refused, the
 # way plugins/asr.py migrates the removed `kws` trigger mode: a deployed card
@@ -341,6 +342,9 @@ TOOLS = [
                 "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.35, "scope": "instance", "advanced": True},
                 "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 3, "scope": "instance", "advanced": True},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": DEFAULT_MIN_SCORE, "scope": "instance", "advanced": True},
+                "darvin_candidate": {"type": "string", "enum": ["", "native60_streaming", "official126_streaming"], "title": "Fine-tuned action model", "description": "Select a pinned model package. Native60 requires hybrid; official126 requires the official126 backend.", "default": "", "scope": "instance", "advanced": True},
+                "official_action_manifest": {"type": "string", "title": "126-label model manifest", "description": "Local artifact manifest for the official126 backend. Includes exact labels, preprocessing and model hash.", "default": "", "scope": "instance", "advanced": True},
+                "official_action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "126-label score threshold", "description": "Model confidence; zero retains every prediction. Calibration, when provided, comes from the model artifact. Independent of the legacy action and fall thresholds.", "default": 0.0, "scope": "instance", "advanced": True},
 
                 # ── advanced: fall detection, camera-dependent ──────────────
                 "fall_drop_ratio": {"type": "number", "minimum": 0.05, "maximum": 1.0, "title": "Fall: hip drop", "description": "How far the hips must drop, as a fraction of standing height. Depends on where the camera is mounted — a lens at 0.4 m and one at 1.2 m measure the same fall differently, so tune this on the robot.", "default": DEFAULT_THRESHOLDS["fall_drop_ratio"], "scope": "instance", "advanced": True},
@@ -445,6 +449,10 @@ class _PoseNode(Node):
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._last_inference_time = 0.0
+        self._last_capture_time = None
+        self._capture_clock = None
+        self._processed_capture_time = None
+        self._processed_capture_clock = None
         self._detect_count = 0
         self._person_count = 0
         self._last_actions: dict = {}
@@ -532,19 +540,31 @@ class _PoseNode(Node):
 
     def _image_cb(self, msg: CompressedImage):
         now = time.monotonic()
-        if now - self._last_inference_time < self._frame_interval:
+        stamp = getattr(getattr(msg, "header", None), "stamp", None)
+        sec, nsec = getattr(stamp, "sec", None), getattr(stamp, "nanosec", None)
+        stamped = (type(sec) is int and type(nsec) is int and sec >= 0
+                   and 0 <= nsec < 1000000000 and sec + nsec > 0)
+        capture_time = float(sec) + nsec / 1e9 if stamped else now
+        clock = "header" if stamped else "ingress_monotonic"
+        if stamped and self._capture_clock == clock and self._last_capture_time is not None:
+            gap = capture_time - self._last_capture_time
+            if 0 <= gap < self._frame_interval - 1e-9:
+                return
+        elif not stamped and now - self._last_inference_time < self._frame_interval:
             return
         self._last_inference_time = now
+        self._last_capture_time, self._capture_clock = capture_time, clock
+        queued = (msg.data, capture_time, clock)
         # Drop the old frame if the queue is full (no backpressure).
         try:
-            self._frame_queue.put_nowait(msg.data)
+            self._frame_queue.put_nowait(queued)
         except queue.Full:
             try:
                 self._frame_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._frame_queue.put_nowait(msg.data)
+                self._frame_queue.put_nowait(queued)
             except queue.Full:
                 pass
 
@@ -554,7 +574,7 @@ class _PoseNode(Node):
 
         while not self._stop_event.is_set():
             try:
-                jpeg_bytes = self._frame_queue.get(timeout=1.0)
+                jpeg_bytes, capture_time, capture_clock = self._frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             started = time.time()
@@ -568,12 +588,32 @@ class _PoseNode(Node):
                 boxes, scores, keypoints = decode_poses(
                     outputs, meta, self._confidence
                 )
-                persons = self._describe(boxes, scores, keypoints, frame, started)
+                self._accept_capture_time(capture_time, capture_clock)
+                persons = self._describe(boxes, scores, keypoints, frame, capture_time)
                 self._publish(persons, frame, started)
             except Exception as e:
                 log.error(f"[pose] inference error: {e}", exc_info=True)
 
     # ── payload construction ─────────────────────────────────────────────
+
+    def _accept_capture_time(self, timestamp, clock):
+        """Called by the worker only; reset histories on a replay/clock discontinuity.
+
+        A new clip with increasing timestamps still requires a fresh node/stop.
+        Missing/zero ROS stamps use ingress time, which is not video PTS.
+        """
+        if not math.isfinite(timestamp):
+            raise ValueError("nonfinite capture timestamp")
+        if self._processed_capture_time is not None and (
+                clock != self._processed_capture_clock or timestamp <= self._processed_capture_time):
+            self._tracker.reset()
+            if self._gesture_tracker is not None:
+                self._gesture_tracker.reset()
+            if self._hand_channel is not None:
+                self._hand_channel.reset()
+            self._last_prediction = {}
+            self._last_actions = {}
+        self._processed_capture_time, self._processed_capture_clock = timestamp, clock
 
     def _describe(self, boxes, scores, keypoints, frame, now_wall: float) -> list:
         """Associate, classify, and build one record per person.
@@ -641,13 +681,14 @@ class _PoseNode(Node):
                                        "pending_posture": pending}
 
             activity = verdict.get("activity")
+            absence = "<no_activity>" if getattr(self._classifier, "uses_official_taxonomy", False) else "none"
             name, _ = track.activity_stabiliser.update(
-                activity["name"] if activity else "none")
+                activity["name"] if activity else absence)
             if activity and name != activity["name"]:
                 verdict["evidence"] = {**(verdict.get("evidence") or {}),
                                        "raw_activity": activity["name"]}
                 verdict["activity"] = None
-            elif not activity and name != "none":
+            elif not activity and name != absence:
                 # The stabiliser is still holding the previous activity; do not
                 # resurrect it with a stale score, just say nothing this frame.
                 pass
@@ -703,6 +744,8 @@ class _PoseNode(Node):
             "posture_confidence": verdict.get("posture_confidence", 0.0),
         }
         activity = verdict.get("activity")
+        if verdict.get("backend_error"):
+            record["activity_error"] = (verdict.get("evidence") or {}).get("reason", "action backend failure")
         if activity:
             record["activity"] = activity["name"]
             record["activity_zh"] = activity["name_zh"]
@@ -1072,6 +1115,9 @@ class PosePerceptionPlugin:
             str(plugin_cfg.get("action_backend", "hybrid")))
         self._action_min_score = float(
             plugin_cfg.get("action_min_score", DEFAULT_MIN_SCORE))
+        self._darvin_candidate = str(plugin_cfg.get("darvin_candidate", ""))
+        self._official_action_manifest = str(plugin_cfg.get("official_action_manifest", ""))
+        self._official_action_min_score = float(plugin_cfg.get("official_action_min_score", 0.0))
         self._label_hold = int(plugin_cfg.get("label_hold", 3))
         self._activity_interval_s = float(
             plugin_cfg.get("activity_interval_s", 0.35))
@@ -1130,6 +1176,11 @@ class PosePerceptionPlugin:
                 str(icfg.get("action_backend", self._action_backend))),
             "action_min_score": float(icfg.get("action_min_score",
                                                self._action_min_score)),
+            "darvin_candidate": str(icfg.get("darvin_candidate", self._darvin_candidate)),
+            "official_action_manifest": str(icfg.get("official_action_manifest",
+                                                       self._official_action_manifest)),
+            "official_action_min_score": float(icfg.get("official_action_min_score",
+                                                        self._official_action_min_score)),
             "label_hold": int(icfg.get("label_hold", self._label_hold)),
             "activity_interval_s": float(icfg.get(
                 "activity_interval_s", self._activity_interval_s)),
@@ -1266,9 +1317,21 @@ class PosePerceptionPlugin:
         thresholds.setdefault("kpt_confidence", merged["kpt_confidence"])
         name = merged["action_backend"]
         self._backend_fallback = None
+        if merged.get("darvin_candidate"):
+            from plugins.darvin_action import build_darvin_backend
+            return build_darvin_backend(merged["darvin_candidate"], merged, thresholds)
         if name == "rules":
             return build_backend("rules", thresholds=thresholds,
                                  action_window_s=merged["action_window_s"])
+        if name == "official126":
+            # An explicit official artifact must never fall back to another
+            # vocabulary, motion gate, fixed fall index or legacy score bar.
+            from plugins.official_action import OfficialActionBackend
+            return OfficialActionBackend(
+                manifest_path=merged["official_action_manifest"],
+                window_s=merged["action_window_s"],
+                min_score=merged["official_action_min_score"],
+            )
         try:
             return build_backend(
                 name,
@@ -1411,7 +1474,8 @@ class PosePerceptionPlugin:
         for rank, index in enumerate(order, start=1):
             box = boxes[index]
             kpts = keypoints[index]
-            frame_features = PoseFrame(0.0, box, kpts, merged["kpt_confidence"])
+            frame_features = PoseFrame(0.0, box, kpts, merged["kpt_confidence"],
+                                       image_size=(width, height))
             verdict = classifier.classify_frame(frame_features)
             cx = (float(box[0]) + float(box[2])) / 2.0
             cy = (float(box[1]) + float(box[3])) / 2.0
@@ -1707,13 +1771,21 @@ class PosePerceptionPlugin:
 
         elif action == "list_actions":
             effective = self._effective_backend()
+            activities = action_vocabulary() if effective != "rules" else []
+            if effective == "official126":
+                from plugins.official_action import canonical_labels
+                activities = [{"official_id": row["official_id"], "output_index": row["output_index"],
+                               "name": row["activity"], "name_zh": row["activity_zh"]}
+                              for row in canonical_labels()]
             return {
                 "ok": True,
                 "backend": effective,
                 # Two vocabularies, because two questions are being answered.
                 "postures": sorted(POSTURE_LABELS_ZH),
-                "activities": (action_vocabulary() if effective != "rules" else []),
+                "activities": activities,
                 "backend_note": (
+                    "official126: exact official labels, including static actions and none; softmax scores with optional artifact-declared temporal calibration."
+                    if effective == "official126" else
                     "hybrid：posture（身体是什么姿势）来自关键点几何，单帧可判；"
                     "activity（人在做什么）来自 ST-GCN++，用它自己的 NTU-60 词表，"
                     "需要画面里有运动。两者答的不是同一个问题 —— NTU-60 的 60 个类"
@@ -1859,6 +1931,7 @@ class PosePerceptionPlugin:
             "keypoint_names": list(COCO_KEYPOINTS),
             "action_backend": self._action_backend,
             "action_backend_effective": self._effective_backend(),
+            "darvin_candidate": self._darvin_candidate,
             "postures": sorted(POSTURE_LABELS_ZH),
             "instances": instances,
             "topic_in": topics_in,
@@ -1929,7 +2002,7 @@ class PosePerceptionPlugin:
                     f"{self._action_backend!r} 偏低：模型判的是一段视频，"
                     f"{self._action_window_s}s 窗口在这个帧率下只有约 "
                     f"{int(min(configured_fps) * self._action_window_s)} 帧真实数据，"
-                    f"要被重采样到 engine 的 48 帧 —— 大部分是插值出来的。"
+                    f"要被重采样到 engine 的 100 帧 —— 大部分是插值出来的。"
                     f"挥手/跌倒这类动作建议 fps >= "
                     f"{MIN_FPS_FOR_TEMPORAL_BACKEND}")
 
@@ -2112,6 +2185,12 @@ class PosePerceptionPlugin:
             self._action_backend = self._migrate_backend(str(cfg["action_backend"]))
         if "action_min_score" in cfg:
             self._action_min_score = float(cfg["action_min_score"])
+        if "darvin_candidate" in cfg:
+            self._darvin_candidate = str(cfg["darvin_candidate"])
+        if "official_action_manifest" in cfg:
+            self._official_action_manifest = str(cfg["official_action_manifest"])
+        if "official_action_min_score" in cfg:
+            self._official_action_min_score = float(cfg["official_action_min_score"])
         if "label_hold" in cfg:
             self._label_hold = int(cfg["label_hold"])
         if "activity_interval_s" in cfg:
