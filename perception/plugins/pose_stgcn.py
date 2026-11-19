@@ -503,10 +503,10 @@ class SkeletonActionBackend:
                             else [outputs])]
         for array in arrays:
             flat = array.reshape(-1)
-            if flat.size >= len(NTU60):
+            if flat.size == len(NTU60):
                 return flat
         raise ActionBackendError(
-            f"no engine output has {len(NTU60)} classes; "
+            f"no engine output has exactly {len(NTU60)} classes; "
             f"got shapes {[a.shape for a in arrays]} — is this an NTU-60 head?"
         )
 

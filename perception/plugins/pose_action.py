@@ -119,7 +119,7 @@ ACTIVITY_LABELS_ZH = {
     "point to something": "指向某处",
     "raising hand": "举手",
     "arms crossed": "抱臂",
-    "walking": "走动",
+    "walking": "行走",
     "turning": "转身",
 }
 
@@ -140,7 +140,7 @@ ACTION_LABELS_ZH = {
     "waving": "挥手/招手",
     "pointing": "指向",
     "arms_crossed": "抱臂",
-    "walking": "走动",
+    "walking": "行走",
     "turning": "转身",
     "still": "静止",
     "fall": "跌倒",

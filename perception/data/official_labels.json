@@ -1,0 +1,632 @@
+[
+  {
+    "official_id": 1,
+    "activity": "drink water",
+    "activity_zh": "喝水"
+  },
+  {
+    "official_id": 2,
+    "activity": "eat meal",
+    "activity_zh": "吃东西"
+  },
+  {
+    "official_id": 3,
+    "activity": "brush teeth",
+    "activity_zh": "刷牙"
+  },
+  {
+    "official_id": 4,
+    "activity": "brush hair",
+    "activity_zh": "梳头"
+  },
+  {
+    "official_id": 5,
+    "activity": "wear jacket",
+    "activity_zh": "穿外套"
+  },
+  {
+    "official_id": 6,
+    "activity": "take off jacket",
+    "activity_zh": "脱外套"
+  },
+  {
+    "official_id": 7,
+    "activity": "wear a shoe",
+    "activity_zh": "穿鞋"
+  },
+  {
+    "official_id": 8,
+    "activity": "take off a shoe",
+    "activity_zh": "脱鞋"
+  },
+  {
+    "official_id": 9,
+    "activity": "wear on glasses",
+    "activity_zh": "戴眼镜"
+  },
+  {
+    "official_id": 10,
+    "activity": "take off glasses",
+    "activity_zh": "摘眼镜"
+  },
+  {
+    "official_id": 11,
+    "activity": "put on a hat",
+    "activity_zh": "戴帽子"
+  },
+  {
+    "official_id": 12,
+    "activity": "take off a hat",
+    "activity_zh": "摘帽子"
+  },
+  {
+    "official_id": 13,
+    "activity": "cutting something",
+    "activity_zh": "切东西"
+  },
+  {
+    "official_id": 14,
+    "activity": "pouring something",
+    "activity_zh": "倒液体"
+  },
+  {
+    "official_id": 15,
+    "activity": "cooking something",
+    "activity_zh": "烹饪"
+  },
+  {
+    "official_id": 16,
+    "activity": "opening refrigerator",
+    "activity_zh": "打开冰箱"
+  },
+  {
+    "official_id": 17,
+    "activity": "washing dishes",
+    "activity_zh": "洗碗"
+  },
+  {
+    "official_id": 18,
+    "activity": "cleaning toilet",
+    "activity_zh": "清洁马桶"
+  },
+  {
+    "official_id": 19,
+    "activity": "cleaning windows",
+    "activity_zh": "擦洗窗户"
+  },
+  {
+    "official_id": 20,
+    "activity": "doing laundry",
+    "activity_zh": "洗衣服"
+  },
+  {
+    "official_id": 21,
+    "activity": "folding clothes",
+    "activity_zh": "叠衣服"
+  },
+  {
+    "official_id": 22,
+    "activity": "hand washing clothes",
+    "activity_zh": "手洗衣服"
+  },
+  {
+    "official_id": 23,
+    "activity": "ironing",
+    "activity_zh": "熨衣服"
+  },
+  {
+    "official_id": 24,
+    "activity": "making the bed",
+    "activity_zh": "整理床铺"
+  },
+  {
+    "official_id": 25,
+    "activity": "mopping floor",
+    "activity_zh": "拖地"
+  },
+  {
+    "official_id": 26,
+    "activity": "moving furniture",
+    "activity_zh": "搬动家具"
+  },
+  {
+    "official_id": 27,
+    "activity": "sweeping floor",
+    "activity_zh": "扫地"
+  },
+  {
+    "official_id": 28,
+    "activity": "watering plants",
+    "activity_zh": "给植物浇水"
+  },
+  {
+    "official_id": 29,
+    "activity": "rub two hands",
+    "activity_zh": "搓手"
+  },
+  {
+    "official_id": 30,
+    "activity": "flick hair",
+    "activity_zh": "拨头发"
+  },
+  {
+    "official_id": 31,
+    "activity": "wipe face",
+    "activity_zh": "擦脸"
+  },
+  {
+    "official_id": 32,
+    "activity": "cutting nails",
+    "activity_zh": "剪指甲"
+  },
+  {
+    "official_id": 33,
+    "activity": "sniff/smell",
+    "activity_zh": "闻气味"
+  },
+  {
+    "official_id": 34,
+    "activity": "apply cream on face",
+    "activity_zh": "脸上涂面霜"
+  },
+  {
+    "official_id": 35,
+    "activity": "apply cream on hand",
+    "activity_zh": "手上涂护手霜"
+  },
+  {
+    "official_id": 36,
+    "activity": "yawn",
+    "activity_zh": "打哈欠"
+  },
+  {
+    "official_id": 37,
+    "activity": "stretch oneself",
+    "activity_zh": "伸懒腰"
+  },
+  {
+    "official_id": 38,
+    "activity": "none",
+    "activity_zh": "无动作"
+  },
+  {
+    "official_id": 39,
+    "activity": "reading",
+    "activity_zh": "看书"
+  },
+  {
+    "official_id": 40,
+    "activity": "writing",
+    "activity_zh": "写字"
+  },
+  {
+    "official_id": 41,
+    "activity": "tear up paper",
+    "activity_zh": "撕纸"
+  },
+  {
+    "official_id": 42,
+    "activity": "drop",
+    "activity_zh": "东西掉了"
+  },
+  {
+    "official_id": 43,
+    "activity": "pickup",
+    "activity_zh": "捡东西"
+  },
+  {
+    "official_id": 44,
+    "activity": "throw",
+    "activity_zh": "扔东西"
+  },
+  {
+    "official_id": 45,
+    "activity": "kicking something",
+    "activity_zh": "踢东西"
+  },
+  {
+    "official_id": 46,
+    "activity": "reach into pocket",
+    "activity_zh": "掏口袋"
+  },
+  {
+    "official_id": 47,
+    "activity": "phone call",
+    "activity_zh": "打电话"
+  },
+  {
+    "official_id": 48,
+    "activity": "play with phone",
+    "activity_zh": "玩手机"
+  },
+  {
+    "official_id": 49,
+    "activity": "type on keyboard",
+    "activity_zh": "打字"
+  },
+  {
+    "official_id": 50,
+    "activity": "taking a selfie",
+    "activity_zh": "自拍"
+  },
+  {
+    "official_id": 51,
+    "activity": "check time",
+    "activity_zh": "看表"
+  },
+  {
+    "official_id": 52,
+    "activity": "put on headphone",
+    "activity_zh": "戴耳机"
+  },
+  {
+    "official_id": 53,
+    "activity": "take off headphone",
+    "activity_zh": "摘耳机"
+  },
+  {
+    "official_id": 54,
+    "activity": "staple book",
+    "activity_zh": "订书"
+  },
+  {
+    "official_id": 55,
+    "activity": "counting money",
+    "activity_zh": "数钱"
+  },
+  {
+    "official_id": 56,
+    "activity": "cutting paper",
+    "activity_zh": "剪纸"
+  },
+  {
+    "official_id": 57,
+    "activity": "open bottle",
+    "activity_zh": "开瓶子"
+  },
+  {
+    "official_id": 58,
+    "activity": "toss a coin",
+    "activity_zh": "抛硬币"
+  },
+  {
+    "official_id": 59,
+    "activity": "fold paper",
+    "activity_zh": "折纸"
+  },
+  {
+    "official_id": 60,
+    "activity": "ball up paper",
+    "activity_zh": "揉纸成团"
+  },
+  {
+    "official_id": 61,
+    "activity": "play magic cube",
+    "activity_zh": "玩魔方"
+  },
+  {
+    "official_id": 62,
+    "activity": "put on bag",
+    "activity_zh": "背上包"
+  },
+  {
+    "official_id": 63,
+    "activity": "take off bag",
+    "activity_zh": "取下包"
+  },
+  {
+    "official_id": 64,
+    "activity": "put object into bag",
+    "activity_zh": "把物品放进包里"
+  },
+  {
+    "official_id": 65,
+    "activity": "take object out of bag",
+    "activity_zh": "从包里取出物品"
+  },
+  {
+    "official_id": 66,
+    "activity": "open a box",
+    "activity_zh": "打开盒子"
+  },
+  {
+    "official_id": 67,
+    "activity": "move heavy objects",
+    "activity_zh": "搬重物"
+  },
+  {
+    "official_id": 68,
+    "activity": "throw up cap/hat",
+    "activity_zh": "抛帽子"
+  },
+  {
+    "official_id": 69,
+    "activity": "squat down",
+    "activity_zh": "蹲下"
+  },
+  {
+    "official_id": 70,
+    "activity": "sit down",
+    "activity_zh": "坐下"
+  },
+  {
+    "official_id": 71,
+    "activity": "stand up",
+    "activity_zh": "起身"
+  },
+  {
+    "official_id": 72,
+    "activity": "hopping",
+    "activity_zh": "单脚跳"
+  },
+  {
+    "official_id": 73,
+    "activity": "jump up",
+    "activity_zh": "跳起"
+  },
+  {
+    "official_id": 74,
+    "activity": "shoot at basket",
+    "activity_zh": "投篮"
+  },
+  {
+    "official_id": 75,
+    "activity": "bounce ball",
+    "activity_zh": "拍球"
+  },
+  {
+    "official_id": 76,
+    "activity": "tennis bat swing",
+    "activity_zh": "挥网球拍"
+  },
+  {
+    "official_id": 77,
+    "activity": "juggle table tennis ball",
+    "activity_zh": "颠乒乓球"
+  },
+  {
+    "official_id": 78,
+    "activity": "arm circles",
+    "activity_zh": "手臂绕环"
+  },
+  {
+    "official_id": 79,
+    "activity": "arm swings",
+    "activity_zh": "手臂摆动"
+  },
+  {
+    "official_id": 80,
+    "activity": "run on the spot",
+    "activity_zh": "原地跑步"
+  },
+  {
+    "official_id": 81,
+    "activity": "butt kicks",
+    "activity_zh": "后踢腿"
+  },
+  {
+    "official_id": 82,
+    "activity": "cross toe touch",
+    "activity_zh": "交叉摸脚尖"
+  },
+  {
+    "official_id": 83,
+    "activity": "side kick",
+    "activity_zh": "侧踢腿"
+  },
+  {
+    "official_id": 84,
+    "activity": "hush",
+    "activity_zh": "做嘘声手势"
+  },
+  {
+    "official_id": 85,
+    "activity": "thumb up",
+    "activity_zh": "竖大拇指"
+  },
+  {
+    "official_id": 86,
+    "activity": "thumb down",
+    "activity_zh": "竖大拇指向下"
+  },
+  {
+    "official_id": 87,
+    "activity": "make OK sign",
+    "activity_zh": "比OK手势"
+  },
+  {
+    "official_id": 88,
+    "activity": "make victory sign",
+    "activity_zh": "比胜利手势"
+  },
+  {
+    "official_id": 89,
+    "activity": "snap fingers",
+    "activity_zh": "打响指"
+  },
+  {
+    "official_id": 90,
+    "activity": "shake fist",
+    "activity_zh": "挥拳"
+  },
+  {
+    "official_id": 91,
+    "activity": "clapping",
+    "activity_zh": "鼓掌"
+  },
+  {
+    "official_id": 92,
+    "activity": "salute",
+    "activity_zh": "敬礼"
+  },
+  {
+    "official_id": 93,
+    "activity": "cheer up",
+    "activity_zh": "欢呼"
+  },
+  {
+    "official_id": 94,
+    "activity": "hand waving",
+    "activity_zh": "挥手"
+  },
+  {
+    "official_id": 95,
+    "activity": "point to something",
+    "activity_zh": "指向某处"
+  },
+  {
+    "official_id": 96,
+    "activity": "nod head / bow",
+    "activity_zh": "点头/鞠躬"
+  },
+  {
+    "official_id": 97,
+    "activity": "shake head",
+    "activity_zh": "摇头"
+  },
+  {
+    "official_id": 98,
+    "activity": "put palms together",
+    "activity_zh": "合掌"
+  },
+  {
+    "official_id": 99,
+    "activity": "cross hands in front",
+    "activity_zh": "双手交叉(制止)"
+  },
+  {
+    "official_id": 100,
+    "activity": "capitulate",
+    "activity_zh": "举手投降"
+  },
+  {
+    "official_id": 101,
+    "activity": "cross arms",
+    "activity_zh": "双臂交叉抱胸"
+  },
+  {
+    "official_id": 102,
+    "activity": "follow",
+    "activity_zh": "跟随"
+  },
+  {
+    "official_id": 103,
+    "activity": "walking",
+    "activity_zh": "行走"
+  },
+  {
+    "official_id": 104,
+    "activity": "stop",
+    "activity_zh": "停止"
+  },
+  {
+    "official_id": 105,
+    "activity": "turn",
+    "activity_zh": "转向"
+  },
+  {
+    "official_id": 106,
+    "activity": "come here",
+    "activity_zh": "过来"
+  },
+  {
+    "official_id": 107,
+    "activity": "forward",
+    "activity_zh": "直行"
+  },
+  {
+    "official_id": 108,
+    "activity": "left turn",
+    "activity_zh": "左转"
+  },
+  {
+    "official_id": 109,
+    "activity": "left turn waiting",
+    "activity_zh": "左转待转"
+  },
+  {
+    "official_id": 110,
+    "activity": "right turn",
+    "activity_zh": "右转"
+  },
+  {
+    "official_id": 111,
+    "activity": "lane changing",
+    "activity_zh": "变道"
+  },
+  {
+    "official_id": 112,
+    "activity": "slow down",
+    "activity_zh": "减速"
+  },
+  {
+    "official_id": 113,
+    "activity": "pull over",
+    "activity_zh": "靠边停车"
+  },
+  {
+    "official_id": 114,
+    "activity": "Attention",
+    "activity_zh": "引起注意"
+  },
+  {
+    "official_id": 115,
+    "activity": "Rally",
+    "activity_zh": "召集／集合"
+  },
+  {
+    "official_id": 116,
+    "activity": "MoveInReverse",
+    "activity_zh": "后退"
+  },
+  {
+    "official_id": 117,
+    "activity": "sneeze / cough",
+    "activity_zh": "打喷嚏/咳嗽"
+  },
+  {
+    "official_id": 118,
+    "activity": "staggering",
+    "activity_zh": "踉跄"
+  },
+  {
+    "official_id": 119,
+    "activity": "falling down",
+    "activity_zh": "跌倒"
+  },
+  {
+    "official_id": 120,
+    "activity": "touch head",
+    "activity_zh": "捂头(头痛)"
+  },
+  {
+    "official_id": 121,
+    "activity": "touch chest",
+    "activity_zh": "捂胸(胸痛)"
+  },
+  {
+    "official_id": 122,
+    "activity": "touch back",
+    "activity_zh": "捂背(背痛)"
+  },
+  {
+    "official_id": 123,
+    "activity": "touch neck",
+    "activity_zh": "捂脖子"
+  },
+  {
+    "official_id": 124,
+    "activity": "nausea / vomiting",
+    "activity_zh": "恶心/呕吐"
+  },
+  {
+    "official_id": 125,
+    "activity": "fan self",
+    "activity_zh": "扇风(热)"
+  },
+  {
+    "official_id": 126,
+    "activity": "blow nose",
+    "activity_zh": "擤鼻涕"
+  }
+]

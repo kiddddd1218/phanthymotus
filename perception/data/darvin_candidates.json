@@ -1,0 +1,38 @@
+{
+  "native60_streaming": {
+    "backend": "hybrid",
+    "revision": "9519a7496bf1e6aee348f4c64fb0860b1c62cfa9",
+    "base_url": "https://modelscope.ai/models/will4para/darvin314-native60-streaming/resolve/9519a7496bf1e6aee348f4c64fb0860b1c62cfa9",
+    "cache_directory": "native60_streaming-9519a7496bf1",
+    "files": {
+      "action60.onnx": {
+        "size": 5681809,
+        "sha256": "77979a52a435ed04bb837d4765e9afe482e9b24b56640f6a96de9752d9739741"
+      },
+      "artifact.json": {
+        "size": 4458,
+        "sha256": "c8a442edfb3f53b211e7f58a7b9d6f9985b4cd7c1f1cc44cabf34b73c8d736f3"
+      }
+    }
+  },
+  "official126_streaming": {
+    "backend": "official126",
+    "revision": "96f986d331d1c809bbad185d9013361d1a0c3213",
+    "base_url": "https://modelscope.ai/models/will4para/darvin314-official126-streaming/resolve/96f986d331d1c809bbad185d9013361d1a0c3213",
+    "cache_directory": "official126_streaming-96f986d331d1",
+    "files": {
+      "action126.onnx": {
+        "size": 5749890,
+        "sha256": "1ca5431952202ee6fac50de32ae16e6ec24674ed0788903e550a26796e48fe54"
+      },
+      "artifact.json": {
+        "size": 18141,
+        "sha256": "769b33cc28b9f71e113fa97992d053a8004a4c996099bb574e6ec6685a636c2a"
+      },
+      "calibration.json": {
+        "size": 1318,
+        "sha256": "1ba2b8bae93c3c5d29e6a786b8a95040a38d2d9b6e79c4328644ecc2b2f60fe1"
+      }
+    }
+  }
+}

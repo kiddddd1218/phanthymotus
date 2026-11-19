@@ -266,6 +266,8 @@ plugins:
   # enabled-but-unwired card costs nothing. On an 8 GB Orin the binding
   # constraint is memory, not GPU time.
   pose:
+    hands: false
+    activity_interval_s: 0.5
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
     # `s` rather than `n`. Keypoint precision is not cosmetic here, it is the
@@ -277,7 +279,7 @@ plugins:
     # need pose, the lever is `enabled`, not a smaller model whose keypoints the
     # rules cannot rely on.
     model: "yolo26s-pose"
-    confidence: 0.4     # person-detection threshold
+    confidence: 0.4
     # 12 rather than 5. The geometry judges per frame, but the skeleton-action
     # model judges a **clip**: a 2.5 s window at 5 fps is 13 real frames
     # resampled up to the engine's 100, most of it interpolation — and the
@@ -287,7 +289,7 @@ plugins:
     # Per-joint visibility threshold. A joint below it takes no part in the
     # rules and is not drawn.
     kpt_confidence: 0.3
-    max_persons: 5
+    max_persons: 1
     # ── Three output topics, and why they are separate ───────────────────
     #   {topic}/poses              data/json      lean: posture + activity
     #   {topic}/poses/skeleton     sensor/pose2d  full keypoints, for the dashboard
@@ -324,7 +326,7 @@ plugins:
     publish_overlay: false
     # How far back the action rules look. The frequency of a wave and the
     # cadence of a walk are both counted inside this window.
-    action_window_s: 1.5
+    action_window_s: 2.5
     # ── Action backend ───────────────────────────────────────────────────
     # hybrid (default) = postures from the geometry, activities from the
     #                    ST-GCN++ skeleton-action model
@@ -356,12 +358,17 @@ plugins:
     # a false fall makes the robot interrupt itself to ask whether somebody is
     # hurt.
     action_min_score: 0.40
+    # Used only when action_backend is explicitly set to official126.
+    # Pinned ModelScope candidate; empty keeps the original backend behavior.
+    darvin_candidate: native60_streaming
+    official_action_manifest: ""
+    official_action_min_score: 0.0
     # Label hysteresis: how many consecutive frames a new label must win before
     # it replaces the current one. Every threshold here is a cliff, and at the
     # boundaries the raw answer flips on every frame. The cost is latency on
     # every genuine change, exactly `hold - 1` frames — 167 ms at 12 fps. The
     # raw answer stays visible in evidence.raw_posture / raw_activity.
-    label_hold: 3
+    label_hold: 1
     # ── Fall thresholds ──────────────────────────────────────────────────
     # These are **not** constants, which is why they are instance config. The
     # same fall measures differently depending on where the camera is mounted:

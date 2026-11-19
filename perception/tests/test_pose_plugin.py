@@ -847,7 +847,7 @@ def test_the_default_backend_is_hybrid():
     schema = pose_plugin.TOOLS[0]["configSchema"]["properties"]["action_backend"]
     assert schema["default"] == "hybrid"
     # `stgcn` is deliberately absent — see WITHDRAWN_BACKENDS.
-    assert set(schema["enum"]) == {"rules", "hybrid"}
+    assert set(schema["enum"]) == {"rules", "hybrid", "official126"}
 
 
 def test_choosing_rules_needs_no_action_engine_at_all():
