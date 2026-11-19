@@ -586,7 +586,14 @@ COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/data/     /work/data/
 COPY perception/deploy/    /deploy/
+
+# Keep pinned action assets in the image, outside any shared /models mount.
+# This performs size/SHA256 verification only; it does not load ONNX or use a GPU.
+# Download or integrity failures fail the build, before evaluation starts.
+ENV ACTION_MODEL_DIR=/work/models/action
+RUN python3 -m plugins.darvin_assets /work/config.yaml
 
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────
 # Runs the frontend that was just copied in, on the Python this image actually

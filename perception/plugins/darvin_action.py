@@ -5,23 +5,22 @@ artifact failures must not fall back to the original model or geometry-only mode
 """
 import json
 import logging
-import os
 from pathlib import Path
 
 import numpy as np
 
 from plugins.official_action import OfficialActionBackend, INPUT_SHAPE
 from plugins.pose_stgcn import ActionBackendError, NTU60, build_backend
+from plugins import darvin_assets
 
 log = logging.getLogger(__name__)
 
 
 def candidate_spec(name):
-    path = Path(__file__).resolve().parents[1] / "data/darvin_candidates.json"
-    specs = json.loads(path.read_text(encoding="utf-8"))
-    if name not in specs:
-        raise ActionBackendError("unknown Darvin candidate: " + str(name))
-    return specs[name]
+    try:
+        return darvin_assets.candidate_spec(name)
+    except ValueError as error:
+        raise ActionBackendError(str(error)) from error
 
 
 class Native60OnnxEngine:
@@ -70,9 +69,7 @@ def build_darvin_backend(name, merged, thresholds):
         raise ActionBackendError("Darvin candidate and action_backend disagree")
     if merged.get("official_action_manifest"):
         raise ActionBackendError("choose either a pinned Darvin candidate or a local official manifest")
-    from utils.model_downloader import ensure_verified_bundle
-    directory = Path(os.environ.get("ACTION_MODEL_DIR", "/models/action")) / spec["cache_directory"]
-    paths = ensure_verified_bundle("darvin314-" + name, str(directory), spec["base_url"], spec["files"])
+    paths = darvin_assets.ensure_candidate_bundle(name, spec)
     manifest = json.loads(Path(paths["artifact.json"]).read_text(encoding="utf-8"))
     engine_name = manifest.get("engine", {}).get("file")
     if (engine_name not in spec["files"] or manifest["engine"]["sha256"] != spec["files"][engine_name]["sha256"]):
