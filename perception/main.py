@@ -50,6 +50,8 @@ from pathlib import Path
 
 import yaml
 
+from utils.runtime_profile import apply_runtime_profile, executor_options, log_process_memory
+
 import rclpy
 import rclpy.executors
 
@@ -111,7 +113,7 @@ def sse_push(event: dict):
 def _load_config() -> dict:
     config_path = os.environ.get("CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
     with open(config_path) as f:
-        return yaml.safe_load(f)
+        return apply_runtime_profile(yaml.safe_load(f))
 
 
 # ── Bundle ────────────────────────────────────────────────────────────────────
@@ -249,6 +251,8 @@ class PerceptionBundle:
                 )
                 log.info("PosePerceptionPlugin loaded (namespace=%s)", namespace)
             except Exception:
+                if cfg.get("runtime_profile") == "pose_only":
+                    raise
                 log.error("PosePerceptionPlugin failed to load; continuing without pose",
                           exc_info=True)
 
@@ -735,9 +739,16 @@ def main():
     os.environ.setdefault("RCUTILS_LOGGING_SEVERITY_THRESHOLD", "50")
     os.environ.setdefault("ROS_LOG_LEVEL", "WARN")
 
+    log.info("runtime_profile=%s enabled_plugins=%s executor_options=%s",
+             cfg.get("runtime_profile", "default"),
+             sorted(name for name, values in cfg.get("plugins", {}).items()
+                    if isinstance(values, dict) and values.get("enabled")),
+             executor_options(cfg))
+    log_process_memory(log, "before_bundle")
     rclpy.init()
-    executor = rclpy.executors.MultiThreadedExecutor()
+    executor = rclpy.executors.MultiThreadedExecutor(**executor_options(cfg))
     _bundle  = PerceptionBundle(cfg, executor)
+    log_process_memory(log, "after_bundle")
 
     def _spin():
         """Spin the executor, surviving a single entity's teardown race.
@@ -773,8 +784,9 @@ def main():
 
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 
-    # Start WebSocket ASR server in a separate thread
-    threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
+    # A pose-only benchmark has no audio WebSocket service to run.
+    if cfg.get("runtime_profile") != "pose_only":
+        threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
 
     _start_registration(mcp_port, "Perception Stack", "perception")
 

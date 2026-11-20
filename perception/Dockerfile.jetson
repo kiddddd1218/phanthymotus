@@ -697,6 +697,9 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 # One write per log line instead of 8 KB block flushes that can tear a Docker
 # log record mid-write.
 ENV PYTHONUNBUFFERED=1
+# Ten evaluation processes share the Jetson. Bound native CPU pools before
+# Python imports NumPy/OpenMP; the action ORT sessions already use one thread.
+ENV OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 # ANSI colour codes are control bytes; in a non-tty container log they are
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0

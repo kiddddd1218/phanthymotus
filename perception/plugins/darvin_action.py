@@ -12,6 +12,7 @@ import numpy as np
 from plugins.official_action import OfficialActionBackend, INPUT_SHAPE
 from plugins.pose_stgcn import ActionBackendError, NTU60, build_backend
 from plugins import darvin_assets
+from utils.runtime_profile import log_process_memory
 
 log = logging.getLogger(__name__)
 
@@ -86,4 +87,5 @@ def build_darvin_backend(name, merged, thresholds):
                     min_score=merged["action_min_score"])
     log.info("[pose/darvin] candidate=%s model_revision=%s engine_sha256=%s provider=CPUExecutionProvider",
              name, spec["revision"], manifest["engine"]["sha256"])
+    log_process_memory(log, "action_model_ready")
     return backend

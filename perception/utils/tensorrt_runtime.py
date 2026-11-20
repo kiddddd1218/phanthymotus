@@ -24,6 +24,7 @@ import ctypes.util
 import json
 import logging
 import math
+import os
 import threading
 from pathlib import Path
 
@@ -204,21 +205,23 @@ def read_engine_file(path: str | Path) -> tuple[dict, bytes]:
     Plain TensorRT engines are returned unchanged with `{}` metadata.
     """
     try:
-        serialized = Path(path).read_bytes()
+        with Path(path).open("rb") as stream:
+            file_size = os.fstat(stream.fileno()).st_size
+            header_size = int.from_bytes(stream.read(4), "little", signed=True)
+            if 0 < header_size <= min(file_size - 4, 1 << 20):
+                header = stream.read(header_size)
+                if len(header) == header_size:
+                    try:
+                        metadata = json.loads(header.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        metadata = None
+                    if isinstance(metadata, dict) and "task" in metadata:
+                        # Read just the payload into the buffer passed to TensorRT.
+                        return metadata, stream.read(file_size - 4 - header_size)
+            stream.seek(0)
+            return {}, stream.read(file_size)
     except OSError as error:
         raise TensorRTError(f"TensorRT engine could not be read: {path}") from error
-    if len(serialized) < 8:
-        return {}, serialized
-    metadata_size = int.from_bytes(serialized[:4], "little", signed=True)
-    if metadata_size <= 0 or metadata_size > min(len(serialized) - 4, 1 << 20):
-        return {}, serialized
-    try:
-        metadata = json.loads(serialized[4 : 4 + metadata_size].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return {}, serialized
-    if not isinstance(metadata, dict) or "task" not in metadata:
-        return {}, serialized
-    return metadata, serialized[4 + metadata_size :]
 
 
 # ── CUDA runtime ─────────────────────────────────────────────────────────────
