@@ -125,6 +125,66 @@ def _plugin(cfg=None, model=None):
     return plugin, executor
 
 
+@pytest.mark.parametrize("kill_holder", [False, True])
+def test_cold_body_engines_serialize_between_workers(tmp_path, monkeypatch, kill_holder):
+    import multiprocessing
+    import time
+    from plugins import vision_runtime
+    from utils import runtime_profile
+
+    monkeypatch.setattr(runtime_profile, "_POSE_LOAD_LOCK", tmp_path / "pose-load")
+    ctx = multiprocessing.get_context("fork")
+    first_entered, second_ready, second_entered = [ctx.Event() for _ in range(3)]
+    release = tmp_path / "release"
+
+    def worker(first):
+        plugin, _ = _plugin({"serialize_engine_loads": True})
+        plugin._model = None
+
+        def resolve():
+            if not first:
+                second_ready.set()
+            return "pose.engine"
+
+        def construct(path):
+            if first:
+                first_entered.set()
+                while not release.exists():
+                    time.sleep(0.01)
+            else:
+                second_entered.set()
+            return _FakeModel()
+
+        plugin._resolve_engine = resolve
+        vision_runtime.VisionEngineSession = construct
+        plugin._ensure_model()
+        plugin._ensure_model()
+
+    first = ctx.Process(target=worker, args=(True,))
+    second = ctx.Process(target=worker, args=(False,))
+    first.start()
+    try:
+        assert first_entered.wait(5)
+        second.start()
+        assert second_ready.wait(5)
+        assert not second_entered.wait(0.2)
+        if kill_holder:
+            first.kill()
+        else:
+            release.touch()
+        assert second_entered.wait(5)
+        second.join(5)
+        assert second.exitcode == 0
+    finally:
+        release.touch()
+        for child in (first, second):
+            if child.pid is not None:
+                child.join(2)
+                if child.is_alive():
+                    child.kill()
+                    child.join(2)
+
+
 def _publisher(node, topic):
     return next((p for p in node.publishers if p.topic == topic), None)
 
@@ -249,6 +309,28 @@ def test_a_started_card_publishes_lean_json_and_a_skeleton():
     assert len(skeleton["keypoint_names"]) == N_KEYPOINTS
     assert len(skeleton["persons"][0]["keypoints"]) == N_KEYPOINTS
     assert skeleton["persons"][0]["posture"] == "standing"
+
+
+def test_stream_releases_decoded_frame_while_waiting_for_the_next_jpeg(monkeypatch):
+    import cv2
+    import weakref
+
+    decoded = []
+    decode = cv2.imdecode
+
+    def track_decode(*args):
+        frame = decode(*args)
+        decoded.append(weakref.ref(frame))
+        return frame
+
+    monkeypatch.setattr(cv2, "imdecode", track_decode)
+    plugin, _ = _plugin({"action_backend": "rules"})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    try:
+        _feed(plugin, "/cam/rgb")
+        assert _wait_until(lambda: decoded and decoded[0]() is None)
+    finally:
+        plugin.dispatch("pose", {"action": "stop", "instance_id": "/cam/rgb"})
 
 
 def test_the_lean_stream_carries_no_keypoints_by_default():

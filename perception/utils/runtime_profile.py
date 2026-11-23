@@ -6,6 +6,40 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+_POSE_LOAD_LOCK = Path("/dev/shm/phanthymotus-pose-engine-load")
+
+
+def release_idle_heap():
+    """Return free glibc heap pages at worker lifecycle boundaries on Jetson."""
+    import ctypes
+
+    trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+    if trim is not None:
+        trim(ctypes.c_size_t(0))
+
+
+@contextmanager
+def pose_engine_load_slot(logger, enabled):
+    """Coordinate cold pose constructors across containers sharing /dev/shm."""
+    if not enabled:
+        yield
+        return
+
+    import fcntl
+
+    # Keep the directory in place so all waiters lock the same inode.
+    # Linux drops the advisory lock when the holder closes the fd or exits.
+    _POSE_LOAD_LOCK.mkdir(mode=0o755, exist_ok=True)
+    fd = os.open(_POSE_LOAD_LOCK, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        with memory_stage(logger, "pose.engine_load_wait"):
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        with memory_stage(logger, "pose.engine_load_slot"):
+            yield
+    finally:
+        os.close(fd)
+
+
 def apply_runtime_profile(config):
     """Keep the benchmark's pose-only contract even if plugin flags are edited.
 

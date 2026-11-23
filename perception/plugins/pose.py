@@ -53,7 +53,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from utils.ros_lifecycle import dispose_node
-from utils.runtime_profile import log_process_memory, trace_enabled
+from utils.runtime_profile import log_process_memory, pose_engine_load_slot, release_idle_heap, trace_enabled
 
 from plugins.image_input import BadInput, load_image_bytes
 from plugins.official_action import OfficialOnnxSessionCache
@@ -572,30 +572,32 @@ class _PoseNode(Node):
                 pass
 
     def _inference_worker(self):
+        while not self._stop_event.is_set():
+            try:
+                packet = self._frame_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self._process_frame(*packet)
+            except Exception as e:
+                log.error(f"[pose] inference error: {e}", exc_info=True)
+            finally:
+                del packet
+
+    def _process_frame(self, jpeg_bytes, capture_time, capture_clock):
+        """Release the decoded frame and outputs before waiting for the next JPEG."""
         import cv2
         from plugins.vision_runtime import decode_poses
 
-        while not self._stop_event.is_set():
-            try:
-                jpeg_bytes, capture_time, capture_clock = self._frame_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            started = time.time()
-            try:
-                frame = cv2.imdecode(
-                    np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
-                )
-                if frame is None:
-                    continue
-                outputs, meta = self._model.infer(frame)
-                boxes, scores, keypoints = decode_poses(
-                    outputs, meta, self._confidence
-                )
-                self._accept_capture_time(capture_time, capture_clock)
-                persons = self._describe(boxes, scores, keypoints, frame, capture_time)
-                self._publish(persons, frame, started)
-            except Exception as e:
-                log.error(f"[pose] inference error: {e}", exc_info=True)
+        started = time.time()
+        frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return
+        outputs, meta = self._model.infer(frame)
+        boxes, scores, keypoints = decode_poses(outputs, meta, self._confidence)
+        self._accept_capture_time(capture_time, capture_clock)
+        persons = self._describe(boxes, scores, keypoints, frame, capture_time)
+        self._publish(persons, frame, started)
 
     # ── payload construction ─────────────────────────────────────────────
 
@@ -1396,8 +1398,11 @@ class PosePerceptionPlugin:
             from plugins.vision_runtime import VisionEngineSession
 
             engine_path = self._resolve_engine()
-            log.info(f"[pose] loading engine: {engine_path}")
-            self._model = VisionEngineSession(engine_path)
+            with pose_engine_load_slot(log, self._plugin_cfg.get("serialize_engine_loads", False)):
+                log.info(f"[pose] loading engine: {engine_path}")
+                self._model = VisionEngineSession(engine_path)
+                if self._plugin_cfg.get("release_idle_heap", False):
+                    release_idle_heap()
             log.info(f"[pose] engine loaded: {self._model_name} "
                      f"input={self._model.input_size}, "
                      f"{N_KEYPOINTS} keypoints")
@@ -1725,6 +1730,9 @@ class PosePerceptionPlugin:
         # ROS node name leak and the next start trips "Publisher already
         # registered".
         dispose_node(self._executor, node, label=f"pose/{node_key}")
+        if self._plugin_cfg.get("release_idle_heap", False):
+            del node
+            release_idle_heap()
         return result
 
     def _loading_camera_info(self, args: dict, instance_id: str) -> dict:

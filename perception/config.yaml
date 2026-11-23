@@ -269,6 +269,9 @@ plugins:
   # enabled-but-unwired card costs nothing. On an 8 GB Orin the binding
   # constraint is memory, not GPU time.
   pose:
+    # Judge workers share /dev/shm. Load one TensorRT body engine at a time.
+    serialize_engine_loads: true
+    release_idle_heap: true
     hands: false
     activity_interval_s: 0.5
     enabled: true
