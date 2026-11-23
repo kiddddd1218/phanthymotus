@@ -56,6 +56,7 @@ from utils.ros_lifecycle import dispose_node
 from utils.runtime_profile import log_process_memory, trace_enabled
 
 from plugins.image_input import BadInput, load_image_bytes
+from plugins.official_action import OfficialOnnxSessionCache
 from plugins.pose_action import (
     ACTION_LABELS_ZH,
     DEFAULT_THRESHOLDS,
@@ -1139,6 +1140,7 @@ class PosePerceptionPlugin:
         # progress is indistinguishable from a hung one.
         self._model_load_status = None
         self._model_lock = threading.Lock()
+        self._official_onnx_sessions = OfficialOnnxSessionCache()
 
         # The hand engine is a *second* engine, loaded only when a card asks
         # for hands. Its own lock, not the body engine's: a hand fetch must not
@@ -1324,7 +1326,8 @@ class PosePerceptionPlugin:
         self._backend_fallback = None
         if merged.get("darvin_candidate"):
             from plugins.darvin_action import build_darvin_backend
-            return build_darvin_backend(merged["darvin_candidate"], merged, thresholds)
+            return build_darvin_backend(merged["darvin_candidate"], merged, thresholds,
+                                        session_cache=self._official_onnx_sessions)
         if name == "rules":
             return build_backend("rules", thresholds=thresholds,
                                  action_window_s=merged["action_window_s"])

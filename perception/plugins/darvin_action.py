@@ -64,7 +64,7 @@ def validate_native60(manifest):
         raise ActionBackendError("native60 artifact contract mismatch")
 
 
-def build_darvin_backend(name, merged, thresholds):
+def build_darvin_backend(name, merged, thresholds, *, session_cache=None):
     spec = candidate_spec(name)
     if merged["action_backend"] != spec["backend"]:
         raise ActionBackendError("Darvin candidate and action_backend disagree")
@@ -79,7 +79,7 @@ def build_darvin_backend(name, merged, thresholds):
         with memory_stage(log, "official126.init"):
             backend = OfficialActionBackend(manifest_path=paths["artifact.json"],
                         window_s=merged["action_window_s"], min_score=merged["official_action_min_score"])
-            backend._ensure_engine()
+            backend._ensure_engine(session_cache)
     else:
         validate_native60(manifest)
         engine = Native60OnnxEngine(paths[engine_name], manifest)

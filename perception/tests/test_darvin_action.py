@@ -2,12 +2,15 @@
 import copy
 from types import SimpleNamespace
 import sys
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import pytest
 
 from plugins.darvin_action import Native60OnnxEngine, build_darvin_backend, validate_native60
 from plugins.pose_stgcn import ActionBackendError, NTU60
 from plugins.pose import PosePerceptionPlugin
+from plugins.official_action import OfficialOnnxSessionCache
 
 
 def manifest():
@@ -63,3 +66,30 @@ def test_explicit_candidate_does_not_silently_become_rules():
     plugin = PosePerceptionPlugin({"action_backend": "rules", "darvin_candidate": "native60_streaming"}, "test", None)
     with pytest.raises(ActionBackendError, match="disagree"):
         plugin._classifier_for(plugin._merged_config(""))
+
+
+def test_concurrent_first_load_and_failed_replacement(monkeypatch):
+    cache = OfficialOnnxSessionCache()
+    ready = threading.Barrier(4)
+    loads = []
+
+    def load(path, taxonomy, normalization):
+        loads.append(path)
+        if path == 'broken':
+            raise ActionBackendError('incompatible model')
+        return object()
+
+    def acquire(index):
+        ready.wait(timeout=5)
+        return cache.acquire('ok', 'digest', 'taxonomy', 'fix')
+
+    monkeypatch.setattr('plugins.official_action._OnnxEngine', load)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        engines = list(pool.map(acquire, range(4)))
+    assert all(engine is engines[0] for engine in engines)
+    assert loads == ['ok']
+    with pytest.raises(ActionBackendError):
+        cache.acquire('broken', 'other', 'taxonomy', 'fix')
+    assert cache.acquire('ok', 'digest', 'taxonomy', 'fix') is engines[0]
+    assert cache.acquire('ok', 'new digest', 'taxonomy', 'fix') is not engines[0]
+    assert loads == ['ok', 'broken', 'ok']

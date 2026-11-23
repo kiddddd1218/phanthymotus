@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,7 +13,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from plugins.official_action import (ActionBackendError, CausalWindow, FORMAT, INPUT_SHAPE,
-    OfficialActionBackend, canonical_labels, causal_blob, file_hash, pose_blob,
+    OfficialActionBackend, OfficialOnnxSessionCache, canonical_labels, causal_blob, file_hash, pose_blob,
     schema_hash, validate_manifest)
 from plugins.pose_stgcn import SkeletonActionBackend, pre_normalize_2d, resample_clip
 
@@ -28,6 +29,47 @@ class FakeEngine:
 
 
 class OfficialActionTests(unittest.TestCase):
+    def test_retired_node_keeps_no_tracking_state_in_reused_session(self):
+        from test_pose_plugin import _plugin
+        plugin, _ = _plugin({"darvin_candidate": "official126_streaming", "action_backend": "official126"})
+        paths = {"artifact.json": str(self.path / "artifact.json")}
+        spec = {"backend": "official126", "revision": "fixture", "files": {"model.onnx": self.manifest["engine"]}}
+        engine = FakeEngine(np.zeros((1, 126), np.float32))
+        with patch("plugins.darvin_action.candidate_spec", return_value=spec), \
+                patch("plugins.darvin_assets.ensure_candidate_bundle", return_value=paths), \
+                patch("plugins.official_action._OnnxEngine", return_value=engine) as load:
+            for instance in ("__warmup__", "/clip", "/clip"):
+                plugin.dispatch("pose", {"action": "start", "input_topic": "/input", "instance_id": instance})
+                try:
+                    node = plugin._nodes[instance]
+                    self.assertEqual(node._tracker.tracks, [])
+                    self.assertIsNone(node._classifier.last_error)
+                    self.assertIs(node._classifier._ensure_engine(), engine)
+                    node._tracker.update([[0., 0., 100., 200.]], self.raw[:1], 1., (640, 480))
+                    self.assertEqual(len(node._tracker.tracks), 1)
+                    node._classifier._load_error = "retired clip error"
+                finally:
+                    plugin.dispatch("pose", {"action": "stop", "instance_id": instance})
+                self.assertFalse(plugin._nodes)
+            load.assert_called_once()
+
+    def test_session_reuse_still_validates_and_isolates_per_clip_settings(self):
+        cache = OfficialOnnxSessionCache()
+        path = self.path / 'artifact.json'
+        engine = FakeEngine(np.zeros((1, 126), np.float32))
+        with patch('plugins.official_action._OnnxEngine', return_value=engine) as load:
+            first = OfficialActionBackend(manifest_path=path, window_s=1., min_score=0.)
+            second = OfficialActionBackend(manifest_path=path, window_s=2.5, min_score=.9)
+            self.assertIs(first._ensure_engine(cache), second._ensure_engine(cache))
+            first._load_error = 'previous clip'
+            self.assertIsNone(second.last_error)
+            self.assertNotEqual(first.history_s, second.history_s)
+            self.assertNotEqual(first.min_score, second.min_score)
+            (self.path / 'model.onnx').write_bytes(b'wrong model')
+            with self.assertRaises(ActionBackendError):
+                OfficialActionBackend(manifest_path=path)._ensure_engine(cache)
+            load.assert_called_once()
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

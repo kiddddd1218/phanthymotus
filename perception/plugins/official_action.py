@@ -7,12 +7,15 @@ Capture/video time must be supplied by the caller; processing time is not used.
 from collections import deque
 import hashlib
 import json
+import logging
 import math
+import threading
 from pathlib import Path
 
 import numpy as np
 
 from plugins.pose_stgcn import ActionBackendError, pre_normalize_2d, resample_clip, _nothing
+from utils.runtime_profile import memory_stage
 
 INPUT_SHAPE = (1, 2, 100, 17, 3)
 FORMAT = "darvin-official126-v1"
@@ -179,6 +182,23 @@ class _OnnxEngine:
         return self.session.run(None, {self.name: blob})
 
 
+class OfficialOnnxSessionCache:
+    """One verified CPU engine per pose plugin, never a tracker or classifier."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._key = None
+        self._engine = None
+
+    def acquire(self, path, digest, taxonomy_hash, normalization):
+        key = (path, digest, taxonomy_hash, normalization)
+        with self._lock:
+            if self._key != key:
+                with memory_stage(logging.getLogger(__name__), "official126.session_create"):
+                    engine = _OnnxEngine(path, taxonomy_hash, normalization)
+                self._engine, self._key = engine, key
+            return self._engine
+
+
 class OfficialActionBackend:
     uses_official_taxonomy = True
 
@@ -215,10 +235,14 @@ class OfficialActionBackend:
     def last_error(self):
         return self._load_error
 
-    def _ensure_engine(self):
+    def _ensure_engine(self, session_cache=None):
         if self._engine is None:
             if self.manifest["engine"]["kind"] == "onnx_cpu":
-                self._engine = _OnnxEngine(self.engine_path, self.manifest["taxonomy_sha256"], self.normalization)
+                if session_cache is None:
+                    self._engine = _OnnxEngine(self.engine_path, self.manifest["taxonomy_sha256"], self.normalization)
+                else:
+                    self._engine = session_cache.acquire(self.engine_path, self.manifest["engine"]["sha256"],
+                                                         self.manifest["taxonomy_sha256"], self.normalization)
             else:
                 from utils.tensorrt_runtime import TensorRTEngine
                 self._engine = TensorRTEngine(str(self.engine_path))
