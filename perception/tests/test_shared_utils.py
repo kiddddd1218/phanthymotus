@@ -387,6 +387,27 @@ def test_engine_static_shape(tmp_path, monkeypatch, fake_cuda):
     engine.close()
 
 
+def test_engine_traces_startup_in_order(tmp_path, monkeypatch, fake_cuda):
+    from utils import runtime_profile
+    stages = []
+    monkeypatch.setenv("POSE_STARTUP_TRACE", "1")
+    monkeypatch.setattr(runtime_profile, "log_process_memory", lambda logger, stage: stages.append(stage))
+    _install_fake_tensorrt(monkeypatch)
+    path = tmp_path / "static.engine"
+    path.write_bytes(b"static")
+    engine = trt_rt.TensorRTEngine(path)
+    engine.close()
+    operations = ["engine_import", "cuda_init", "runtime_create", "read_plan", "deserialize", "execution_context"]
+    assert stages == [f"trt.{operation}.{bound}" for operation in operations for bound in ("begin", "end")]
+
+
+def test_plan_read_failure_releases_cuda_stream(tmp_path, monkeypatch, fake_cuda):
+    _install_fake_tensorrt(monkeypatch)
+    with pytest.raises(trt_rt.TensorRTError, match="engine could not be read"):
+        trt_rt.TensorRTEngine(tmp_path / "missing.engine")
+    assert fake_cuda.streams_created == fake_cuda.streams_destroyed == 1
+
+
 def test_engine_rejects_multi_input(tmp_path, monkeypatch, fake_cuda):
     module = _install_fake_tensorrt(monkeypatch)
 

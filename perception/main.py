@@ -744,6 +744,8 @@ def main():
              sorted(name for name, values in cfg.get("plugins", {}).items()
                     if isinstance(values, dict) and values.get("enabled")),
              executor_options(cfg))
+    if cfg.get("runtime_profile") == "pose_only":
+        os.environ.setdefault("POSE_STARTUP_TRACE", "1")
     log_process_memory(log, "before_bundle")
     rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor(**executor_options(cfg))

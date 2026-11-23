@@ -12,7 +12,7 @@ import numpy as np
 from plugins.official_action import OfficialActionBackend, INPUT_SHAPE
 from plugins.pose_stgcn import ActionBackendError, NTU60, build_backend
 from plugins import darvin_assets
-from utils.runtime_profile import log_process_memory
+from utils.runtime_profile import log_process_memory, memory_stage
 
 log = logging.getLogger(__name__)
 
@@ -76,9 +76,10 @@ def build_darvin_backend(name, merged, thresholds):
     if (engine_name not in spec["files"] or manifest["engine"]["sha256"] != spec["files"][engine_name]["sha256"]):
         raise ActionBackendError("engine identity differs from pinned candidate")
     if spec["backend"] == "official126":
-        backend = OfficialActionBackend(manifest_path=paths["artifact.json"],
-                    window_s=merged["action_window_s"], min_score=merged["official_action_min_score"])
-        backend._ensure_engine()  # Surface missing/incompatible runtime at activation.
+        with memory_stage(log, "official126.init"):
+            backend = OfficialActionBackend(manifest_path=paths["artifact.json"],
+                        window_s=merged["action_window_s"], min_score=merged["official_action_min_score"])
+            backend._ensure_engine()
     else:
         validate_native60(manifest)
         engine = Native60OnnxEngine(paths[engine_name], manifest)

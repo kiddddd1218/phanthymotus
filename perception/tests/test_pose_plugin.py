@@ -546,6 +546,18 @@ def _fire(node, persons, times=2):
         node._publish(persons)
 
 
+def test_first_action_marker_only_after_nonempty_output(monkeypatch):
+    from plugins import pose
+    stages = []
+    monkeypatch.setenv("POSE_STARTUP_TRACE", "1")
+    monkeypatch.setattr(pose, "log_process_memory", lambda logger, stage: stages.append(stage))
+    _, node = _started()
+    node._publish([])
+    assert stages == []
+    _fire(node, [_gesture_person()])
+    assert stages == ["first_action_published"]
+
+
 def test_a_gesture_transition_reaches_the_gesture_topic():
     plugin, node = _started()
     _fire(node, [_gesture_person()])

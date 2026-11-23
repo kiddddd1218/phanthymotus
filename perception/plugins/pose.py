@@ -53,6 +53,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from utils.ros_lifecycle import dispose_node
+from utils.runtime_profile import log_process_memory, trace_enabled
 
 from plugins.image_input import BadInput, load_image_bytes
 from plugins.pose_action import (
@@ -405,6 +406,7 @@ class _PoseNode(Node):
         self._frame_interval = 1.0 / max(fps, 0.1)
 
         self._activity_interval_s = float(activity_interval_s)
+        self._trace_first_action = trace_enabled()
         # Most recent raw model output, so `info` can show what it actually
         # scored. "The activity field is empty" is otherwise impossible to tell
         # from "the model was never asked" or "nothing cleared the threshold".
@@ -839,6 +841,9 @@ class _PoseNode(Node):
         message = String()
         message.data = json.dumps(payload, ensure_ascii=False)
         self._pub.publish(message)
+        if self._trace_first_action and any(row.get("activity") for row in payload["persons"]):
+            self._trace_first_action = False
+            log_process_memory(log, "first_action_published")
 
         height, width = ((frame.shape[0], frame.shape[1])
                          if frame is not None and hasattr(frame, "shape")

@@ -30,6 +30,8 @@ from pathlib import Path
 
 import numpy as np
 
+from utils.runtime_profile import memory_stage
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -68,7 +70,8 @@ _FAMILY_ALIASES = {
 def tensorrt_version() -> str:
     """Return the importable TensorRT version string (raises TensorRTError)."""
     try:
-        import tensorrt
+        with memory_stage(log, "trt.family_import"):
+            import tensorrt
     except ImportError as error:
         raise TensorRTError("TensorRT is not available in this runtime") from error
     return str(getattr(tensorrt, "__version__", ""))
@@ -364,7 +367,8 @@ class TensorRTEngine:
 
     def __init__(self, path: str | Path, *, device_id: int = 0,
                  primary_input: str | None = None):
-        import tensorrt as trt
+        with memory_stage(log, "trt.engine_import"):
+            import tensorrt as trt
 
         self.path = str(path)
         self._trt = trt
@@ -378,15 +382,19 @@ class TensorRTEngine:
         self._active_profile = 0
         self._active_shape: tuple[int, ...] | None = None
 
-        self.metadata, serialized = read_engine_file(self.path)
         try:
-            self._cuda = CudaRuntime(device_id)
+            with memory_stage(log, "trt.cuda_init"):
+                self._cuda = CudaRuntime(device_id)
             # Kept on the instance, not passed inline: TensorRT holds a bare
             # pointer to the logger, so letting a Python-side one be collected
             # segfaults the process at a random later inference.
-            self._logger = _make_logger(trt)
-            self._runtime = trt.Runtime(self._logger)
-            self._engine = self._runtime.deserialize_cuda_engine(serialized)
+            with memory_stage(log, "trt.runtime_create"):
+                self._logger = _make_logger(trt)
+                self._runtime = trt.Runtime(self._logger)
+            with memory_stage(log, "trt.read_plan"):
+                self.metadata, serialized = read_engine_file(self.path)
+            with memory_stage(log, "trt.deserialize"):
+                self._engine = self._runtime.deserialize_cuda_engine(serialized)
             del serialized
             if self._engine is None:
                 # Overwhelmingly this is a version mismatch: an engine plan is
@@ -404,9 +412,10 @@ class TensorRTEngine:
                     f"(see the preceding [TRT] [E] line for the version it "
                     f"expects)."
                 )
-            self._context = self._engine.create_execution_context()
-            if self._context is None:
-                raise TensorRTError(f"failed to create TensorRT context: {self.path}")
+            with memory_stage(log, "trt.execution_context"):
+                self._context = self._engine.create_execution_context()
+                if self._context is None:
+                    raise TensorRTError(f"failed to create TensorRT context: {self.path}")
 
             names = [
                 self._engine.get_tensor_name(index)

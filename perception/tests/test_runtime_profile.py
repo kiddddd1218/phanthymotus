@@ -97,3 +97,37 @@ def test_required_pose_constructor_failure_stops_benchmark_startup(monkeypatch):
     from main import PerceptionBundle
     with pytest.raises(RuntimeError, match="pose initialization failed"):
         PerceptionBundle(apply_runtime_profile(config), object())
+
+
+@pytest.mark.parametrize("kind,member,root,field", [
+    ("cgroup2", "/work/worker", "/work", "memory.current"),
+    ("cgroup2", "/", "/docker/worker", "memory.current"),
+    ("cgroup", "/work/worker", "/", "memory.usage_in_bytes"),
+])
+def test_container_memory_snapshot(tmp_path, kind, member, root, field):
+    from utils.runtime_profile import _group_counters
+    mount = tmp_path / "mount"
+    relative = member[len(root):] if member.startswith(root) else member
+    group = mount / relative.lstrip("/")
+    group.mkdir(parents=True)
+    (group / field).write_text("321")
+    (group / "memory.events").write_text("oom 2\noom_kill 1\n")
+    membership = "0::" if kind == "cgroup2" else "7:memory:"
+    (tmp_path / "cgroup").write_text(membership + member + "\n")
+    (tmp_path / "mountinfo").write_text(f"1 0 0:1 {root} {mount} rw - {kind} none rw,memory\n")
+    counters = _group_counters(tmp_path)
+    assert counters["kind"] == kind and counters[field] == 321
+    if kind == "cgroup2":
+        assert counters["memory.events"]["oom_kill"] == 1
+
+
+def test_unavailable_cgroup_does_not_interrupt_trace(monkeypatch, caplog):
+    from utils import runtime_profile
+    def missing():
+        raise FileNotFoundError()
+    monkeypatch.setattr(runtime_profile, "_group_counters", missing)
+    monkeypatch.setenv("POSE_STARTUP_TRACE", "1")
+    with caplog.at_level(logging.INFO):
+        with runtime_profile.memory_stage(logging.getLogger("test"), "missing"):
+            pass
+    assert '"stage": "missing.end"' in caplog.text and '"cgroup": {}' in caplog.text
