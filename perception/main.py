@@ -50,7 +50,7 @@ from pathlib import Path
 
 import yaml
 
-from utils.runtime_profile import apply_runtime_profile, executor_options, log_process_memory
+from utils.runtime_profile import apply_runtime_profile, log_process_memory
 
 import rclpy
 import rclpy.executors
@@ -117,6 +117,13 @@ def _load_config() -> dict:
 
 
 # ── Bundle ────────────────────────────────────────────────────────────────────
+
+def _shared_executor(cfg):
+    # The benchmark pose node owns a single-thread executor for each clip.
+    if cfg.get("runtime_profile") != "pose_only":
+        return rclpy.executors.MultiThreadedExecutor()
+    return None
+
 
 class PerceptionBundle:
     def __init__(self, cfg: dict, executor):
@@ -739,16 +746,15 @@ def main():
     os.environ.setdefault("RCUTILS_LOGGING_SEVERITY_THRESHOLD", "50")
     os.environ.setdefault("ROS_LOG_LEVEL", "WARN")
 
-    log.info("runtime_profile=%s enabled_plugins=%s executor_options=%s",
+    log.info("runtime_profile=%s enabled_plugins=%s",
              cfg.get("runtime_profile", "default"),
              sorted(name for name, values in cfg.get("plugins", {}).items()
-                    if isinstance(values, dict) and values.get("enabled")),
-             executor_options(cfg))
+                   if isinstance(values, dict) and values.get("enabled")))
     if cfg.get("runtime_profile") == "pose_only":
         os.environ.setdefault("POSE_STARTUP_TRACE", "1")
     log_process_memory(log, "before_bundle")
     rclpy.init()
-    executor = rclpy.executors.MultiThreadedExecutor(**executor_options(cfg))
+    executor = _shared_executor(cfg)
     _bundle  = PerceptionBundle(cfg, executor)
     log_process_memory(log, "after_bundle")
 
@@ -784,7 +790,8 @@ def main():
                               "ROS callbacks were interrupted")
                 time.sleep(1.0)
 
-    threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
+    if executor is not None:
+        threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 
     # A pose-only benchmark has no audio WebSocket service to run.
     if cfg.get("runtime_profile") != "pose_only":
@@ -806,7 +813,8 @@ def main():
         server.serve_forever()
     finally:
         _bundle.shutdown()
-        executor.shutdown()
+        if executor is not None:
+            executor.shutdown()
         rclpy.shutdown()
 
 

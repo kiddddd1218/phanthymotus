@@ -66,11 +66,6 @@ def apply_runtime_profile(config):
     return dict(config, plugins=selected)
 
 
-def executor_options(config):
-    # ROS otherwise sizes its pool from host CPU affinity in every instance.
-    return {"num_threads": 2} if config.get("runtime_profile") == "pose_only" else {}
-
-
 def _memory_group(proc=Path("/proc/self")):
     groups = {}
     for row in (proc / "cgroup").read_text().splitlines():
@@ -102,7 +97,7 @@ def _memory_group(proc=Path("/proc/self")):
     return None
 
 
-def _group_counters(proc=Path("/proc/self")):
+def _group_counters(proc=Path("/proc/self"), *, detailed=False):
     group = _memory_group(proc)
     if not group:
         return {}
@@ -119,6 +114,18 @@ def _group_counters(proc=Path("/proc/self")):
                 values[name] = int(raw)
         except (OSError, ValueError):
             continue
+    if detailed:
+        # v1 reports cache/rss and v2 reports file/anon. Keep the kernel's
+        # names and byte units so the two families can be compared correctly.
+        wanted = {"cache", "rss", "mapped_file", "swap", "anon", "file",
+                  "shmem", "active_file", "inactive_file",
+                  "total_cache", "total_rss", "total_swap"}
+        try:
+            values["memory.stat"] = {key: int(value) for key, value in
+                                     (row.split() for row in (path / "memory.stat").read_text().splitlines())
+                                     if key in wanted}
+        except (OSError, ValueError):
+            pass
     return values
 
 
@@ -147,6 +154,17 @@ def log_process_memory(logger, stage):
     except OSError:
         result["process_status"] = "unavailable"
     if trace_enabled():
+        detailed = stage in {"trt.deserialize.begin", "trt.deserialize.end",
+                             "pose.engine_load_slot.end", "pose.warmup_retired"}
+        if detailed:
+            try:
+                rollup = Path("/proc/self/smaps_rollup").read_text().splitlines()
+                result["process_kib"] = {
+                    key: int(value.split()[0]) for key, value in
+                    (row.split(":", 1) for row in rollup if ":" in row)
+                    if key in {"Pss", "Private_Clean", "Private_Dirty", "SwapPss"}}
+            except (OSError, ValueError, IndexError):
+                pass
         try:
             for row in Path("/proc/meminfo").read_text().splitlines():
                 if row.startswith("MemAvailable:"):
@@ -155,7 +173,7 @@ def log_process_memory(logger, stage):
         except (OSError, ValueError, IndexError):
             pass
         try:
-            result["cgroup"] = _group_counters()
+            result["cgroup"] = _group_counters(detailed=detailed)
         except (OSError, ValueError, IndexError):
             result["cgroup"] = {}
     logger.info("[runtime_memory] %s", json.dumps(result, sort_keys=True))

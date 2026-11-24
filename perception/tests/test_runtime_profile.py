@@ -8,7 +8,7 @@ import types
 import pytest
 import yaml
 
-from utils.runtime_profile import apply_runtime_profile, executor_options, log_process_memory
+from utils.runtime_profile import apply_runtime_profile, log_process_memory
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -59,9 +59,11 @@ def test_pose_profile_blocks_unrelated_imports_even_with_enabled_flags(monkeypat
 
 
 def test_default_profile_preserves_regular_robot_settings():
+    from main import _shared_executor
+    from rclpy.executors import MultiThreadedExecutor
     config = {"plugins": {"asr": {"enabled": True}, "pose": {"enabled": False}}}
     assert apply_runtime_profile(config) is config
-    assert executor_options(config) == {}
+    assert isinstance(_shared_executor(config), MultiThreadedExecutor)
 
 
 @pytest.mark.parametrize("config", [
@@ -74,12 +76,13 @@ def test_invalid_profile_fails_before_model_initialization(config):
         apply_runtime_profile(config)
 
 
-def test_pose_settings_and_small_executor_pool_are_preserved():
+def test_pose_profile_leaves_ros_spin_to_the_clip():
+    from main import _shared_executor
     config = yaml.safe_load((ROOT / "config.yaml").read_text())
     selected = apply_runtime_profile(config)
     assert selected["plugins"]["pose"] == config["plugins"]["pose"]
     assert [k for k, v in selected["plugins"].items() if v.get("enabled")] == ["pose"]
-    assert executor_options(selected) == {"num_threads": 2}
+    assert _shared_executor(selected) is None
 
 
 def test_memory_snapshot_does_not_log_configuration(caplog):
@@ -112,18 +115,22 @@ def test_container_memory_snapshot(tmp_path, kind, member, root, field):
     group.mkdir(parents=True)
     (group / field).write_text("321")
     (group / "memory.events").write_text("oom 2\noom_kill 1\n")
+    (group / "memory.stat").write_text("rss 11\nfile 12\ninactive_file 7\npgfault 400\n")
     membership = "0::" if kind == "cgroup2" else "7:memory:"
     (tmp_path / "cgroup").write_text(membership + member + "\n")
     (tmp_path / "mountinfo").write_text(f"1 0 0:1 {root} {mount} rw - {kind} none rw,memory\n")
     counters = _group_counters(tmp_path)
     assert counters["kind"] == kind and counters[field] == 321
+    assert "memory.stat" not in counters
+    assert _group_counters(tmp_path, detailed=True)["memory.stat"] == {
+        "rss": 11, "file": 12, "inactive_file": 7}
     if kind == "cgroup2":
         assert counters["memory.events"]["oom_kill"] == 1
 
 
 def test_unavailable_cgroup_does_not_interrupt_trace(monkeypatch, caplog):
     from utils import runtime_profile
-    def missing():
+    def missing(**kwargs):
         raise FileNotFoundError()
     monkeypatch.setattr(runtime_profile, "_group_counters", missing)
     monkeypatch.setenv("POSE_STARTUP_TRACE", "1")

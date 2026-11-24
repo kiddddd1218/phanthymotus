@@ -486,6 +486,76 @@ def test_retiring_an_instance_removes_it_from_the_executor_and_destroys_it():
     assert node.destroyed, "destroy_node leaks the publishers and the node name"
 
 
+@pytest.mark.parametrize("block", ["frame", "ros_callback"])
+def test_clip_stop_waits_for_both_threads_before_destroy_and_restart(monkeypatch, block):
+    import rclpy.executors
+
+    entered = threading.Event()
+    release = threading.Event()
+    stopped_executors = []
+
+    class ClipExecutor(_FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.woken = threading.Event()
+            self.active = False
+
+        def spin_once(self, timeout_sec):
+            self.active = True
+            try:
+                if block == "ros_callback" and not release.is_set():
+                    entered.set()
+                    release.wait(15)
+                else:
+                    self.woken.wait(timeout_sec)
+            finally:
+                self.active = False
+
+        def wake(self):
+            self.woken.set()
+
+        def shutdown(self):
+            assert not self.active and not self.nodes
+            stopped_executors.append(self)
+
+    monkeypatch.setattr(rclpy.executors, "SingleThreadedExecutor", ClipExecutor)
+    plugin = pose_plugin.PosePerceptionPlugin({}, "test", None)
+    plugin._model = _FakeModel()
+    start = {"action": "start", "input_topic": "/cam", "instance_id": "clip"}
+    stop = {"action": "stop", "instance_id": "clip"}
+    assert plugin.dispatch("pose", start)["state"] == "running"
+    old = plugin._nodes["clip"]
+    finished = []
+
+    def slow_frame(*packet):
+        entered.set()
+        release.wait(15)
+        finished.append(not old.destroyed)
+
+    try:
+        if block == "frame":
+            monkeypatch.setattr(old, "_process_frame", slow_frame)
+            old._image_cb(_FakeCompressedImage(b"frame"))
+        assert entered.wait(2)
+        assert plugin.dispatch("pose", stop)["state"] == "stopping"
+        assert plugin._retire_node("clip", timeout=0)["state"] == "stopping"
+        assert plugin.dispatch("pose", start)["state"] == "loading"
+        assert not old.destroyed and not stopped_executors
+        release.set()
+        assert _wait_until(lambda: old.destroyed and "clip" not in plugin._retiring)
+        assert len(stopped_executors) == 1
+        if block == "frame":
+            assert finished == [True]
+        assert plugin.dispatch("pose", start)["state"] == "running"
+        new = plugin._nodes["clip"]
+        assert new is not old and new._tracker is not old._tracker
+        assert plugin.dispatch("pose", stop)["state"] == "idle"
+        assert new.destroyed and len(stopped_executors) == 2
+    finally:
+        release.set()
+        plugin.shutdown()
+
+
 def test_stop_with_no_instance_running_is_not_an_error():
     plugin, _ = _plugin()
     assert plugin.dispatch("pose", {"action": "stop"}) == {"state": "idle"}

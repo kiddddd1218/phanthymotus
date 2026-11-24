@@ -44,6 +44,7 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from typing import Optional
 
 import numpy as np
@@ -52,7 +53,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
-from utils.ros_lifecycle import dispose_node
+from utils.ros_lifecycle import PoseClipSpin
 from utils.runtime_profile import log_process_memory, pose_engine_load_slot, release_idle_heap, trace_enabled
 
 from plugins.image_input import BadInput, load_image_bytes
@@ -451,6 +452,7 @@ class _PoseNode(Node):
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
+        self._clip_spin: Optional[PoseClipSpin] = None
         self._last_inference_time = 0.0
         self._last_capture_time = None
         self._capture_clock = None
@@ -474,6 +476,20 @@ class _PoseNode(Node):
         the cancellation flag has to be settable while that start holds the lock.
         """
         self._stop_event.set()
+        if self._clip_spin is not None:
+            self._clip_spin.request_stop()
+
+    def wait_stopped(self, timeout) -> bool:
+        """Drain inference and ROS callbacks under one deadline."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        if self._worker is not None:
+            self._worker.join(timeout)
+            if self._worker.is_alive():
+                return False
+        if self._clip_spin is not None:
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            return self._clip_spin.wait(remaining)
+        return True
 
     def _status(self) -> dict:
         return {
@@ -515,15 +531,14 @@ class _PoseNode(Node):
         Destroying a subscription while the node is still registered with the
         executor races the executor's wait list and kills the spin thread with
         `InvalidHandle`, which takes every subscription in the process with it,
-        silently. Teardown is dispose_node()'s job, after removal from the
-        executor. Same order as vop and ocr.
+        silently. The plugin retires the ROS entities after this method drains
+        the inference worker and any clip-owned executor.
         """
         # Flag first, lock second, so a start() holding the lock sees the flag
         # as soon as it releases rather than this call queueing behind it.
-        self._stop_event.set()
+        self.request_stop()
         with self._lifecycle_lock:
-            if self._worker and self._worker.is_alive():
-                self._worker.join(timeout=3.0)
+            self.wait_stopped(None)
             self._worker = None
             self._running = False
             self._tracker.reset()
@@ -577,6 +592,8 @@ class _PoseNode(Node):
                 packet = self._frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
+            if self._stop_event.is_set():
+                return
             try:
                 self._process_frame(*packet)
             except Exception as e:
@@ -1152,6 +1169,8 @@ class PosePerceptionPlugin:
         self._hand_model_lock = threading.Lock()
 
         self._nodes: dict[str, _PoseNode] = {}
+        self._retiring: dict[str, Future] = {}
+        self._shutting_down = False
         self._instance_configs: dict[str, dict] = {}
         # What the camera feeding each instance said about its optics. `position`
         # here is a normalised lateral offset, so without a field of view it is
@@ -1161,8 +1180,8 @@ class PosePerceptionPlugin:
         # Guards _nodes, _instance_configs and _upstream_camera. Every dispatch()
         # runs on its own ThreadingHTTPServer thread, so an unguarded
         # read-modify-write of _nodes can leave a started node unreachable —
-        # perception/README.md § "Plugin Concurrency". Never held across
-        # node.start()/stop() or a model load.
+        # Node registration and activation are atomic. Retirement joins threads
+        # outside this lock so other instances remain accessible.
         self._nodes_lock = threading.RLock()
 
     # ── config → objects ─────────────────────────────────────────────────
@@ -1665,28 +1684,26 @@ class PosePerceptionPlugin:
                 node = self._nodes.get(_DEFAULT_INSTANCE)
             if node is None and len(self._nodes) == 1:
                 node = next(iter(self._nodes.values()))
-        if node is None:
-            return None
-        try:
-            node.publish_persons(persons, frame, started)
-            return node._output_topic
-        except Exception as error:  # noqa: BLE001 — never fail the answer on this
-            log.warning(f"[pose] could not echo one-shot result: {error}")
-            return None
+            if node is None:
+                return None
+            try:
+                node.publish_persons(persons, frame, started)
+                return node._output_topic
+            except Exception as error:  # noqa: BLE001 — never fail the answer on this
+                log.warning(f"[pose] could not echo one-shot result: {error}")
+                return None
 
     # ── node lifecycle ───────────────────────────────────────────────────
 
     def _start_node(self, node_key: str, input_topic: str):
-        """Create and start a _PoseNode for the given topic.
-
-        Registers the node before starting it so a concurrent stop can always
-        find and cancel it; the lock covers only the registration, never the
-        start, so a stop is not queued behind the start it is trying to abort
-        (perception/README.md § "Plugin Concurrency").
-        """
+        """Activate one fresh node after its previous clip has retired."""
         with self._nodes_lock:
+            if self._shutting_down:
+                return {"state": "idle"}
+            if node_key in self._retiring:
+                return self._restart_status(node_key)
             if node_key in self._nodes:
-                return
+                return self._nodes[node_key]._status()
             merged = self._merged_config(node_key)
             suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
             node = _PoseNode(
@@ -1706,34 +1723,94 @@ class PosePerceptionPlugin:
                 publish_hand_keypoints=merged["publish_hand_keypoints"],
                 hand_gestures=merged["gesture_whitelist"],
             )
-            self._executor.add_node(node)
+            try:
+                status = node.start()
+                if self._executor is None:
+                    node._clip_spin = PoseClipSpin(node)
+                else:
+                    self._executor.add_node(node)
+            except Exception:
+                node.stop()
+                node.destroy_node()
+                raise
             self._nodes[node_key] = node
-        node.start()
         log.info(f"[pose] node started (background): {input_topic}")
+        return status
 
-    def _retire_node(self, node_key: str) -> Optional[dict]:
-        """Stop, unregister and destroy one node. Returns its stop() result."""
+    def _restart_status(self, node_key):
+        retirement = self._retiring[node_key]
+        if retirement.done():
+            return {"state": "error", "message": str(retirement.exception())}
+        return {"state": "loading", "message": "Previous pose clip is stopping"}
+
+    def _retire_node(self, node_key: str, timeout=3.0) -> Optional[dict]:
+        """Bound the MCP wait while retaining ownership until teardown finishes."""
         with self._nodes_lock:
-            node = self._nodes.pop(node_key, None)
-            # Goes with the node: a re-wired card answering info() with the
-            # optics of a camera it is no longer fed by is worse than answering
-            # with nothing, because downstream cannot tell the difference.
+            retirement = self._retiring.get(node_key)
             self._upstream_camera.pop(node_key, None)
-        if node is None:
-            return None
-        node.request_stop()
-        result = node.stop()
-        # remove-then-destroy via the shared helper: the node must leave the
-        # executor before any handle is destroyed, or the spin thread dies on
-        # InvalidHandle and takes every subscription in the process with it. It
-        # must be destroyed and not merely removed, or the publishers and the
-        # ROS node name leak and the next start trips "Publisher already
-        # registered".
-        dispose_node(self._executor, node, label=f"pose/{node_key}")
-        if self._plugin_cfg.get("release_idle_heap", False):
+            node = None
+            if retirement is None:
+                node = self._nodes.pop(node_key, None)
+                if node is None:
+                    return None
+                retirement = Future()
+                self._retiring[node_key] = retirement
+        if node is not None:
+            try:
+                node.request_stop()
+                drained = node.wait_stopped(timeout)
+            except Exception as error:
+                retirement.set_exception(error)
+                raise
+            if drained:
+                self._finish_retirement(node_key, node, retirement)
+            else:
+                log.warning("pose instance %s still draining after %.1fs", node_key, timeout)
+                thread = threading.Thread(target=self._finish_retirement,
+                                          args=(node_key, node, retirement),
+                                          name="pose_clip_retire", daemon=True)
+                try:
+                    thread.start()
+                except RuntimeError:
+                    # Thread creation can fail under resource pressure. The
+                    # current request still owns cleanup in that case.
+                    self._finish_retirement(node_key, node, retirement)
+                return retirement.result() if retirement.done() else {"state": "stopping"}
+        try:
+            return retirement.result(timeout=timeout)
+        except FutureTimeout:
+            if retirement.done():
+                return retirement.result()
+            return {"state": "stopping"}
+
+    def _finish_retirement(self, key, node, retirement):
+        try:
+            result = node.stop()
+            if node._clip_spin is None:
+                self._executor.remove_node(node)
+            else:
+                node._clip_spin.close(node)
+                node._clip_spin = None
+            node.destroy_node()
             del node
-            release_idle_heap()
-        return result
+            if self._plugin_cfg.get("release_idle_heap", False):
+                release_idle_heap()
+            if trace_enabled() and key == "__warmup__":
+                log_process_memory(log, "pose.warmup_retired")
+        except Exception as error:
+            log.exception("failed to retire pose instance %s", key)
+            retirement.set_exception(error)
+            return
+        with self._nodes_lock:
+            del self._retiring[key]
+            retirement.set_result(result)
+
+    def shutdown(self):
+        with self._nodes_lock:
+            self._shutting_down = True
+            keys = list(self._nodes) + list(self._retiring)
+        for key in keys:
+            self._retire_node(key, timeout=None)
 
     def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
         """`{"camera_info": [...]}` for an `info()` answered while loading.
@@ -1777,10 +1854,14 @@ class PosePerceptionPlugin:
                 result = self._retire_node(instance_id)
                 return result if result is not None else {"state": "idle"}
             with self._nodes_lock:
-                keys = list(self._nodes.keys())
-            stopped = [key for key in keys if self._retire_node(key) is not None]
-            return ({"state": "idle", "stopped_instances": stopped} if stopped
-                    else {"state": "idle"})
+                keys = list(self._nodes) + list(self._retiring)
+            results = {key: self._retire_node(key) for key in keys}
+            stopped = [key for key, status in results.items() if status and status["state"] == "idle"]
+            pending = any(status and status["state"] == "stopping" for status in results.values())
+            reply = {"state": "stopping" if pending else "idle"}
+            if stopped:
+                reply["stopped_instances"] = stopped
+            return reply
 
         elif action in ("recognize_by_photo", "recognize_by_url"):
             return self._recognize_image(args, url_action="recognize_by_url")
@@ -2084,16 +2165,18 @@ class PosePerceptionPlugin:
         # Recorded before the node starts, and recorded even when empty, so a
         # restart that no longer carries a declaration replaces the old entry
         # rather than leaving one claiming a camera that is no longer wired.
-        if input_topic:
-            from plugins.camera_info import for_topic as _camera_for_topic
-            with self._nodes_lock:
+        with self._nodes_lock:
+            if self._shutting_down:
+                return {"state": "idle"}
+            if node_key in self._retiring:
+                return self._restart_status(node_key)
+            if input_topic:
+                from plugins.camera_info import for_topic as _camera_for_topic
                 self._upstream_camera[node_key] = _camera_for_topic(
                     args.get("camera_info"), input_topic)
-
-        with self._nodes_lock:
             running = self._nodes.get(node_key)
-        if running is not None:
-            return running.start()
+            if running is not None:
+                return running._status()
 
         if self._model is None:
             if self._model_loading:
@@ -2124,13 +2207,7 @@ class PosePerceptionPlugin:
                     "output": output_topic_for(input_topic),
                     "message": "Engine loading in background, will start automatically"}
 
-        self._start_node(node_key, input_topic)
-        with self._nodes_lock:
-            running = self._nodes.get(node_key)
-        if running is None:
-            # A concurrent stop retired it between start and lookup.
-            return {"state": "idle", "input": input_topic}
-        return running.start()
+        return self._start_node(node_key, input_topic)
 
     def _config(self, args: dict, instance_id: str) -> dict:
         cfg = {k: v for k, v in args.items()
