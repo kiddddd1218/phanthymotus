@@ -696,7 +696,13 @@ TOOLS = [
                 # 不会发生）；关着而操作员想要，结果是他在画布上连好了线、什么都看
                 # 不到、也不知道为什么 —— 而那正是这个开关被要求加上来的起因。
                 # trigger_mode=vad 时这条路径根本不会被走到。
-                "publish_background": {"type": "boolean", "description": "把没有唤醒词的话语发到 <topic>/asr_background（priority 0，供后台 subagent 分析旁边听到的对话）。关掉就回到以前的行为：未触发的句子直接丢弃。注意这条 topic **要在画布上连到 decision_core 才会进 LLM** —— 只打开开关不连线，等于只发不收", "default": True, "scope": "shared"},
+                "publish_background": {
+                    "type": "boolean", "title": "Forward speech without a wake word",
+                    "description": "Send transcriptions that did not match the wake word to the background output.",
+                    "default": True, "scope": "shared",
+                    "x-show-when": {"trigger_mode": "asr_kws"},
+                    "x-keep-when-hidden": True,
+                },
                 # SenseVoice 的解码结果本来就带情绪 / 音频事件 / 语种（见
                 # SherpaOnnxSenseVoiceAdapter.transcribe_rich），以前整段丢掉只
                 # 留 text。打开它不加载模型、不多一次推理 —— 只是别再扔掉。
