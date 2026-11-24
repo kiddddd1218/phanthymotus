@@ -271,6 +271,18 @@ plugins:
   pose:
     # Judge workers share /dev/shm. Load one TensorRT body engine at a time.
     serialize_engine_loads: true
+    # JP5 (TensorRT 8) only; ignored on every other family. A cold body-engine
+    # load waits, holding the load lock, until host MemAvailable is at least
+    # this. On JP5, host-wide MemAvailable fell by 1492-1603 MiB per back-to-back
+    # cold load and the host went 5224 -> 585 MiB after three; the fourth
+    # started at 585, dipped to 287, and that run lost a worker to exit 137.
+    # Those are whole-box figures, not one process's footprint. 2400 = one such
+    # drop (1600) + 800 reserve. 0 disables the gate.
+    jp5_engine_load_min_available_mib: 2400
+    # One finite deadline for lock wait + headroom wait. Past it the load fails
+    # with an explicit error, nothing allocated, and the next `start` retries.
+    # A nonfinite or negative value is a configuration error, not a refusal.
+    engine_load_admission_timeout_s: 180
     release_idle_heap: true
     hands: false
     activity_interval_s: 0.5

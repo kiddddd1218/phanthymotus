@@ -54,7 +54,8 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from utils.ros_lifecycle import PoseClipSpin
-from utils.runtime_profile import log_process_memory, pose_engine_load_slot, release_idle_heap, trace_enabled
+from utils.runtime_profile import (PoseEngineAdmissionError, log_process_memory, pose_engine_load_slot,
+                                   release_idle_heap, trace_enabled)
 
 from plugins.image_input import BadInput, load_image_bytes
 from plugins.official_action import OfficialOnnxSessionCache
@@ -1154,6 +1155,10 @@ class PosePerceptionPlugin:
         self._model = None  # lazy: see the module docstring on memory
         self._model_loading = False
         self._model_load_error = None
+        # True only when the last load was refused by memory admission: nothing
+        # was allocated, so the next `start` tries again instead of the error
+        # sticking for the life of the process.
+        self._model_load_retryable = False
         # The downloader's progress line while the engine bundle is fetched, None
         # once it is in. A cold fetch runs for minutes, and a card with no
         # progress is indistinguishable from a hung one.
@@ -1417,7 +1422,10 @@ class PosePerceptionPlugin:
             from plugins.vision_runtime import VisionEngineSession
 
             engine_path = self._resolve_engine()
-            with pose_engine_load_slot(log, self._plugin_cfg.get("serialize_engine_loads", False)):
+            with pose_engine_load_slot(
+                    log, self._plugin_cfg.get("serialize_engine_loads", False),
+                    min_available_mib=self._engine_admission_floor_mib(),
+                    deadline_s=self._plugin_cfg.get("engine_load_admission_timeout_s")):
                 log.info(f"[pose] loading engine: {engine_path}")
                 self._model = VisionEngineSession(engine_path)
                 if self._plugin_cfg.get("release_idle_heap", False):
@@ -1425,6 +1433,21 @@ class PosePerceptionPlugin:
             log.info(f"[pose] engine loaded: {self._model_name} "
                      f"input={self._model.input_size}, "
                      f"{N_KEYPOINTS} keypoints")
+
+    def _engine_admission_floor_mib(self) -> int:
+        """Host headroom a cold body-engine load must see first; 0 = no gate.
+
+        JP5 (TensorRT 8) only, decided by the TensorRT actually importable:
+        that is the line where one deserialization was measured taking about
+        1.5 GB of host memory. Every other family, and any config without the
+        key, keeps the plain serialized load.
+        """
+        floor = int(self._plugin_cfg.get("jp5_engine_load_min_available_mib", 0) or 0)
+        if floor <= 0:
+            return 0
+        from utils.tensorrt_runtime import tensorrt_family
+
+        return floor if tensorrt_family() == "jp511" else 0
 
     def _resolve_engine(self) -> str:
         """Path to the pose engine for this machine's TensorRT.
@@ -2178,31 +2201,66 @@ class PosePerceptionPlugin:
             if running is not None:
                 return running._status()
 
-        if self._model is None:
-            if self._model_loading:
-                return {"state": "loading",
-                        "message": (self._model_load_status
-                                    or "Engine is still loading, please wait...")}
-            if self._model_load_error:
-                return {"state": "error",
-                        "message": f"Engine failed to load: {self._model_load_error}"}
-
-            def _bg_start():
+        # Reserve the cold attempt under the state lock, so that concurrent
+        # starts and retries see `loading` rather than each queueing a load
+        # (and, on JP5, an admission wait) of their own. The lock is released
+        # before any native work.
+        previous = None
+        with self._nodes_lock:
+            if self._model is None:
+                if self._model_loading:
+                    return {"state": "loading",
+                            "message": (self._model_load_status
+                                        or "Engine is still loading, please wait...")}
+                if self._model_load_error and not self._model_load_retryable:
+                    return {"state": "error",
+                            "message": f"Engine failed to load: {self._model_load_error}"}
+                previous = (self._model_load_error, self._model_load_retryable,
+                            self._model_load_status)
                 self._model_loading = True
                 self._model_load_error = None
+                self._model_load_retryable = False
                 self._model_load_status = None
+
+        if previous is not None:
+            def _bg_start():
                 try:
                     self._ensure_model()
-                    self._model_loading = False
+                except Exception as error:  # noqa: BLE001
+                    # The outcome is published before the reservation is
+                    # dropped, so nobody sees "not loading, no error" and
+                    # starts a second attempt on a failed first.
+                    with self._nodes_lock:
+                        self._model_load_retryable = isinstance(
+                            error, PoseEngineAdmissionError)
+                        self._model_load_error = str(error)
+                        self._model_load_status = None
+                        self._model_loading = False
+                    log.error(f"[pose] engine load failed: {error}", exc_info=True)
+                    return
+                with self._nodes_lock:
                     self._model_load_status = None
+                    self._model_loading = False
+                try:
                     self._start_node(node_key, input_topic)
                 except Exception as error:  # noqa: BLE001
-                    self._model_loading = False
-                    self._model_load_error = str(error)
+                    with self._nodes_lock:
+                        self._model_load_error = str(error)
                     log.error(f"[pose] engine load failed: {error}", exc_info=True)
 
-            threading.Thread(target=_bg_start, daemon=True,
-                             name="pose_model_load").start()
+            try:
+                threading.Thread(target=_bg_start, daemon=True,
+                                 name="pose_model_load").start()
+            except Exception as error:  # noqa: BLE001 — e.g. no thread under pressure
+                # Nothing was attempted: hand the reservation back exactly as
+                # it was found, so a later start can try again.
+                with self._nodes_lock:
+                    (self._model_load_error, self._model_load_retryable,
+                     self._model_load_status) = previous
+                    self._model_loading = False
+                log.error(f"[pose] could not start the engine load thread: {error}")
+                return {"state": "error",
+                        "message": f"Engine load could not be started: {error}"}
             return {"state": "loading", "input": input_topic or "",
                     "output": output_topic_for(input_topic),
                     "message": "Engine loading in background, will start automatically"}

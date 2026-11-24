@@ -185,6 +185,336 @@ def test_cold_body_engines_serialize_between_workers(tmp_path, monkeypatch, kill
                     child.join(2)
 
 
+# ── JP5 load admission ───────────────────────────────────────────────────────
+
+_ADMISSION = {"serialize_engine_loads": True,
+              "jp5_engine_load_min_available_mib": 2400,
+              "engine_load_admission_timeout_s": 5}
+
+
+def _cold_plugin(monkeypatch, tmp_path, cfg, readings, family="jp511"):
+    """A plugin with no engine, a scripted MemAvailable and a recorded load."""
+    from plugins import vision_runtime
+    from utils import runtime_profile, tensorrt_runtime
+
+    monkeypatch.setattr(runtime_profile, "_POSE_LOAD_LOCK", tmp_path / "pose-load")
+    monkeypatch.setattr(runtime_profile, "_ADMISSION_POLL_S", 0.001)
+    monkeypatch.setattr(tensorrt_runtime, "tensorrt_family",
+                        lambda version=None: family)
+    events = []
+
+    def available():
+        value = readings.pop(0) if len(readings) > 1 else readings[0]
+        events.append(("available", value))
+        return value
+
+    def construct(path):
+        events.append(("construct", path))
+        return _FakeModel()
+
+    monkeypatch.setattr(runtime_profile, "host_available_mib", available)
+    monkeypatch.setattr(vision_runtime, "VisionEngineSession", construct)
+    plugin, _ = _plugin(cfg)
+    plugin._model = None
+    plugin._resolve_engine = lambda: "pose.engine"
+    return plugin, events
+
+
+def _load_lock_is_free(tmp_path):
+    import fcntl
+    fd = os.open(tmp_path / "pose-load", os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_jp5_load_with_headroom_is_admitted_on_the_first_reading(monkeypatch, tmp_path):
+    plugin, events = _cold_plugin(monkeypatch, tmp_path, _ADMISSION, [5224])
+    plugin._ensure_model()
+    assert events == [("available", 5224), ("construct", "pose.engine")]
+
+
+def test_jp5_load_waits_out_a_neighbours_high_water(monkeypatch, tmp_path):
+    """585 MiB is where the fourth back-to-back load started in the judge run."""
+    plugin, events = _cold_plugin(monkeypatch, tmp_path, _ADMISSION,
+                                  [585, 2399, 2400])
+    plugin._ensure_model()
+    assert events == [("available", 585), ("available", 2399),
+                      ("available", 2400), ("construct", "pose.engine")]
+    assert _load_lock_is_free(tmp_path)
+
+
+def test_jp5_load_under_sustained_pressure_fails_without_constructing(monkeypatch, tmp_path):
+    from utils.runtime_profile import PoseEngineAdmissionError
+    cfg = dict(_ADMISSION, engine_load_admission_timeout_s=0.05)
+    plugin, events = _cold_plugin(monkeypatch, tmp_path, cfg, [585])
+    with pytest.raises(PoseEngineAdmissionError, match="585 MiB"):
+        plugin._ensure_model()
+    assert plugin._model is None
+    assert ("construct", "pose.engine") not in events
+    assert _load_lock_is_free(tmp_path), "a refused worker must not strand the others"
+
+
+def test_jp5_load_refuses_an_unreadable_meminfo(monkeypatch, tmp_path):
+    from utils.runtime_profile import PoseEngineAdmissionError
+    plugin, events = _cold_plugin(monkeypatch, tmp_path, _ADMISSION, [None])
+    with pytest.raises(PoseEngineAdmissionError, match="unreadable"):
+        plugin._ensure_model()
+    assert events == [("available", None)]
+    assert _load_lock_is_free(tmp_path)
+
+
+def test_other_families_and_unconfigured_cards_are_not_gated(monkeypatch, tmp_path):
+    plugin, events = _cold_plugin(monkeypatch, tmp_path, _ADMISSION, [1], family="jp61")
+    plugin._ensure_model()
+    assert events == [("construct", "pose.engine")]
+    plugin, events = _cold_plugin(monkeypatch, tmp_path,
+                                  {"serialize_engine_loads": True}, [1])
+    plugin._ensure_model()
+    assert events == [("construct", "pose.engine")]
+
+
+def test_a_refused_start_reports_the_error_and_the_next_start_retries(monkeypatch, tmp_path):
+    cfg = dict(_ADMISSION, engine_load_admission_timeout_s=0.05)
+    readings = [585]
+    plugin, events = _cold_plugin(monkeypatch, tmp_path, cfg, readings)
+    start = {"action": "start", "input_topic": "/cam/rgb"}
+    assert plugin.dispatch("pose", start)["state"] == "loading"
+    assert _wait_until(lambda: plugin._model_load_error is not None)
+    assert plugin.dispatch("pose", {"action": "info"})["state"] == "error"
+    assert plugin._nodes == {} and ("construct", "pose.engine") not in events
+
+    readings[:] = [3732]
+    assert plugin.dispatch("pose", start)["state"] == "loading"
+    assert _wait_until(lambda: "/cam/rgb" in plugin._nodes)
+    assert plugin._model_load_error is None
+    assert events.count(("construct", "pose.engine")) == 1
+    plugin.dispatch("pose", {"action": "stop"})
+
+
+def test_a_constructor_failure_after_admission_stays_a_hard_error(monkeypatch, tmp_path):
+    """Only a refusal is retried; a broken engine must not be reloaded in a loop."""
+    from plugins import vision_runtime
+    plugin, _ = _cold_plugin(monkeypatch, tmp_path, _ADMISSION, [5224])
+    calls = []
+
+    def broken(path):
+        calls.append(path)
+        raise RuntimeError("engine plan not compatible")
+
+    monkeypatch.setattr(vision_runtime, "VisionEngineSession", broken)
+    start = {"action": "start", "input_topic": "/cam/rgb"}
+    plugin.dispatch("pose", start)
+    assert _wait_until(lambda: plugin._model_load_error is not None)
+    assert plugin.dispatch("pose", start)["state"] == "error"
+    assert calls == ["pose.engine"]
+    assert _load_lock_is_free(tmp_path)
+
+
+def test_admission_bounds_the_lock_wait_and_never_skips_the_lock(monkeypatch, tmp_path):
+    """`enabled=False` with a floor must still lock: an unlocked check is one
+    two workers can pass on the same reading."""
+    import fcntl
+    import logging
+    from utils import runtime_profile
+
+    lock = tmp_path / "pose-load"
+    lock.mkdir()
+    monkeypatch.setattr(runtime_profile, "_POSE_LOAD_LOCK", lock)
+    monkeypatch.setattr(runtime_profile, "_ADMISSION_POLL_S", 0.001)
+    monkeypatch.setattr(runtime_profile, "host_available_mib", lambda: 9999)
+    holder = os.open(lock, os.O_RDONLY)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with pytest.raises(runtime_profile.PoseEngineAdmissionError, match="lock"):
+            with runtime_profile.pose_engine_load_slot(
+                    logging.getLogger("test"), False,
+                    min_available_mib=1, deadline_s=0.05):
+                pytest.fail("entered the slot while another worker held it")
+    finally:
+        os.close(holder)
+    with runtime_profile.pose_engine_load_slot(
+            logging.getLogger("test"), False, min_available_mib=1, deadline_s=0.05):
+        pass
+
+
+def test_host_available_reads_meminfo_in_mib(tmp_path):
+    from utils.runtime_profile import host_available_mib
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 7000000 kB\nMemAvailable:  599040 kB\n")
+    assert host_available_mib(meminfo) == 585
+    meminfo.write_text("MemTotal: 7000000 kB\n")
+    assert host_available_mib(meminfo) is None
+    assert host_available_mib(tmp_path / "missing") is None
+
+
+class _LatePolls:
+    """Monotonic time under test control; every sleep wakes two seconds late."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds + 2.0
+
+
+def test_a_delayed_poll_that_lands_after_the_deadline_is_refused(monkeypatch, tmp_path):
+    """Scheduler delay can push a sleep past the deadline. A newly sufficient
+    reading must not be accepted then, and the sleep itself must not be asked
+    to outlast the time remaining."""
+    import logging
+    from utils import runtime_profile
+
+    lock = tmp_path / "pose-load"
+    lock.mkdir()
+    monkeypatch.setattr(runtime_profile, "_POSE_LOAD_LOCK", lock)
+    clock = _LatePolls()
+    readings = [585, 4000]
+    monkeypatch.setattr(runtime_profile, "time", clock)
+    monkeypatch.setattr(runtime_profile, "host_available_mib",
+                        lambda: readings.pop(0))
+    with pytest.raises(runtime_profile.PoseEngineAdmissionError,
+                       match="before the admission deadline"):
+        with runtime_profile.pose_engine_load_slot(
+                logging.getLogger("test"), True,
+                min_available_mib=2400, deadline_s=0.2):
+            pytest.fail("a post-deadline reading was accepted")
+    assert clock.sleeps == [0.2], "the sleep must be bounded by the deadline"
+    assert readings == [4000], "no sample may be taken for an expired deadline"
+
+
+def test_a_lock_freed_after_the_deadline_is_not_taken(monkeypatch, tmp_path):
+    import fcntl
+    import logging
+    from utils import runtime_profile
+
+    lock = tmp_path / "pose-load"
+    lock.mkdir()
+    monkeypatch.setattr(runtime_profile, "_POSE_LOAD_LOCK", lock)
+    monkeypatch.setattr(runtime_profile, "host_available_mib", lambda: 9999)
+    clock = _LatePolls()
+    holder = os.open(lock, os.O_RDONLY)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    released = []
+
+    def sleep_and_release(seconds):
+        _LatePolls.sleep(clock, seconds)
+        if not released:
+            released.append(True)
+            os.close(holder)        # the lock comes free, but too late
+
+    clock.sleep = sleep_and_release
+    monkeypatch.setattr(runtime_profile, "time", clock)
+    try:
+        with pytest.raises(runtime_profile.PoseEngineAdmissionError, match="lock"):
+            with runtime_profile.pose_engine_load_slot(
+                    logging.getLogger("test"), True,
+                    min_available_mib=1, deadline_s=1.0):
+                pytest.fail("entered the slot after the lock wait expired")
+        assert released and len(clock.sleeps) == 1
+    finally:
+        if not released:
+            os.close(holder)
+
+
+def test_a_nonfinite_deadline_is_a_configuration_error(monkeypatch, tmp_path):
+    import logging
+    from utils import runtime_profile
+
+    monkeypatch.setattr(runtime_profile, "_POSE_LOAD_LOCK", tmp_path / "pose-load")
+    monkeypatch.setattr(runtime_profile, "host_available_mib", lambda: 9999)
+    for value in (float("inf"), float("nan"), -1):
+        with pytest.raises(ValueError, match="finite"):
+            with runtime_profile.pose_engine_load_slot(
+                    logging.getLogger("test"), True,
+                    min_available_mib=1, deadline_s=value):
+                pytest.fail("admitted with an unusable deadline")
+    assert not (tmp_path / "pose-load").exists(), "rejected before the lock"
+    # Zero is finite and allowed: one unconditional attempt, no waiting.
+    with runtime_profile.pose_engine_load_slot(
+            logging.getLogger("test"), True, min_available_mib=1, deadline_s=0):
+        pass
+
+
+def test_concurrent_starts_share_one_cold_attempt(monkeypatch, tmp_path):
+    """Six starts on a cold card must queue one load, not six admission waits."""
+    from plugins import vision_runtime
+
+    plugin, events = _cold_plugin(monkeypatch, tmp_path, _ADMISSION, [9999])
+    entered, release = threading.Event(), threading.Event()
+
+    def construct(path):
+        events.append(("construct", path))
+        entered.set()
+        release.wait(10)
+        return _FakeModel()
+
+    monkeypatch.setattr(vision_runtime, "VisionEngineSession", construct)
+    loads = []
+    real_thread = threading.Thread
+
+    class Counting(real_thread):
+        def start(self):
+            if self.name == "pose_model_load":
+                loads.append(self)
+            super().start()
+
+    monkeypatch.setattr(threading, "Thread", Counting)
+    barrier = threading.Barrier(6)
+    replies = []
+
+    def go(topic):
+        barrier.wait()
+        replies.append(plugin.dispatch(
+            "pose", {"action": "start", "input_topic": topic}))
+
+    threads = [real_thread(target=go, args=(f"/cam/{i}",)) for i in range(6)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        assert entered.wait(5)
+        assert [reply["state"] for reply in replies] == ["loading"] * 6
+        assert len(loads) == 1
+        assert plugin._model_loading is True
+    finally:
+        release.set()
+    assert _wait_until(lambda: len(plugin._nodes) == 1, timeout=5)
+    assert events.count(("construct", "pose.engine")) == 1
+    plugin.dispatch("pose", {"action": "stop"})
+
+
+class _Unstartable(threading.Thread):
+    def start(self):
+        raise RuntimeError("can't start new thread")
+
+
+def test_a_failed_load_thread_start_rolls_the_reservation_back(monkeypatch, tmp_path):
+    plugin, events = _cold_plugin(monkeypatch, tmp_path, _ADMISSION, [5224])
+    start = {"action": "start", "input_topic": "/cam/rgb"}
+    with monkeypatch.context() as patch:
+        patch.setattr(threading, "Thread", _Unstartable)
+        reply = plugin.dispatch("pose", start)
+    assert reply["state"] == "error" and "could not be started" in reply["message"]
+    assert plugin._model_loading is False
+    assert plugin._model_load_error is None and events == []
+
+    assert plugin.dispatch("pose", start)["state"] == "loading"
+    assert _wait_until(lambda: "/cam/rgb" in plugin._nodes)
+    assert events.count(("construct", "pose.engine")) == 1
+    plugin.dispatch("pose", {"action": "stop"})
+
+
 def _publisher(node, topic):
     return next((p for p in node.publishers if p.topic == topic), None)
 

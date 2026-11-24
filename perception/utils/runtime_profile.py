@@ -1,5 +1,6 @@
 """Explicit startup profiles; no model or ROS imports belong in this module."""
 import json
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -18,14 +19,136 @@ def release_idle_heap():
         trim(ctypes.c_size_t(0))
 
 
+_ADMISSION_POLL_S = 0.5
+DEFAULT_ADMISSION_TIMEOUT_S = 180.0
+
+
+class PoseEngineAdmissionError(RuntimeError):
+    """A cold pose load was refused before anything was allocated.
+
+    Nothing native was created, so a later start may try again.
+    """
+
+
+def host_available_mib(meminfo=Path("/proc/meminfo")):
+    """Whole-host MemAvailable in MiB, or None when it cannot be read.
+
+    Host-wide on purpose: Jetson GPU memory is ordinary system RAM, and the
+    judge's containers share one pool, so a per-cgroup figure would miss the
+    neighbours whose load high-water this is meant to keep apart.
+    """
+    try:
+        for row in meminfo.read_text().splitlines():
+            if row.startswith("MemAvailable:"):
+                return int(row.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _admission_budget_s(deadline_s):
+    """The configured deadline as finite seconds; a bad value is a config error.
+
+    Raised as ValueError, not as an admission refusal: a refusal is retried on
+    the next start, and retrying cannot repair a setting.
+    """
+    budget = DEFAULT_ADMISSION_TIMEOUT_S if deadline_s is None else float(deadline_s)
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError(
+            "engine_load_admission_timeout_s must be a finite number of "
+            "seconds >= 0; got %r" % (deadline_s,))
+    return budget
+
+
+def _admit(logger, fd, floor, deadline):
+    """Take the load lock, then hold it until the host has `floor` MiB available.
+
+    One deadline spans both waits. The first lock attempt and the first
+    reading are unconditional; once this call has slept, nothing observed at
+    or after the deadline is accepted — a late poll that finds the lock free
+    or the memory back is still a refusal — and no sleep outlasts the time
+    remaining.
+    """
+    import fcntl
+
+    waited = False
+
+    def pause(reason):
+        nonlocal waited
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PoseEngineAdmissionError(reason)
+        waited = True
+        time.sleep(min(_ADMISSION_POLL_S, remaining))
+        # The sleep may overrun (scheduler, memory pressure). Do not take
+        # another sample for a deadline that has already passed.
+        if time.monotonic() >= deadline:
+            raise PoseEngineAdmissionError(reason)
+
+    def expired():
+        return waited and time.monotonic() >= deadline
+
+    busy = ("pose engine load not admitted: the shared load lock stayed busy "
+            "until the admission deadline")
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pause(busy)
+            continue
+        if expired():
+            raise PoseEngineAdmissionError(busy)
+        break
+
+    warned = False
+    while True:
+        available = host_available_mib()
+        if available is None:
+            # Unknown is not "enough": proceeding blind is the failure this
+            # gate exists to prevent.
+            raise PoseEngineAdmissionError(
+                "pose engine load not admitted: host MemAvailable is unreadable")
+        short = ("pose engine load not admitted: host available %d MiB was not "
+                 "confirmed at or above the %d MiB floor before the admission "
+                 "deadline" % (available, floor))
+        if expired():
+            raise PoseEngineAdmissionError(short)
+        if available >= floor:
+            logger.info("[pose] engine load admitted: host available %d MiB "
+                        ">= floor %d MiB%s", available, floor,
+                        " (after waiting)" if waited else "")
+            return
+        if not warned:
+            warned = True
+            logger.warning("[pose] engine load waiting: host available %d MiB "
+                           "< floor %d MiB", available, floor)
+        pause(short)
+
+
 @contextmanager
-def pose_engine_load_slot(logger, enabled):
-    """Coordinate cold pose constructors across containers sharing /dev/shm."""
-    if not enabled:
+def pose_engine_load_slot(logger, enabled, *, min_available_mib=0, deadline_s=None):
+    """Coordinate cold pose constructors across containers sharing /dev/shm.
+
+    With `min_available_mib` > 0 the slot is also an admission gate: the
+    constructor only runs once host MemAvailable is at or above the floor,
+    checked while holding the lock so two workers cannot both be admitted on
+    the same reading. Lock wait and headroom wait share one finite deadline;
+    past it PoseEngineAdmissionError is raised and the lock is released. A
+    nonfinite or negative `deadline_s` is a ValueError.
+    A floor always takes the lock, whatever `enabled` says — an unlocked check
+    would be a check two workers can pass together.
+    """
+    floor = max(0, int(min_available_mib or 0))
+    if not enabled and not floor:
         yield
         return
 
     import fcntl
+
+    deadline = None
+    if floor:
+        # Validated before the lock is touched.
+        deadline = time.monotonic() + _admission_budget_s(deadline_s)
 
     # Keep the directory in place so all waiters lock the same inode.
     # Linux drops the advisory lock when the holder closes the fd or exits.
@@ -33,7 +156,10 @@ def pose_engine_load_slot(logger, enabled):
     fd = os.open(_POSE_LOAD_LOCK, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         with memory_stage(logger, "pose.engine_load_wait"):
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if deadline is None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            else:
+                _admit(logger, fd, floor, deadline)
         with memory_stage(logger, "pose.engine_load_slot"):
             yield
     finally:
