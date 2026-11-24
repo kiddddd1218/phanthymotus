@@ -356,21 +356,23 @@ def _segment_phones(seg_text: str, lang: str):
 
 def _phone_char_ends(text: str, start: int, end: int, lang: str,
                      phones: list, phonemized: bool) -> list:
-    """For one segment, the character offset each of its phonemes ends at.
+    """Map segment phones to complete-word (or CJK character) boundaries.
 
-    Counted from growing prefixes of the segment, phonemized with the same function
-    that produced ``phones``, so the mapping is exact. The previous code
-    extrapolated it from a phonemes-per-character ratio, which ate a character
-    whenever that ratio was not uniform: for '\u5c0f\u6f58\u5c0f\u6f58\uff0c\u73b0\u5728\u53d1\u751f\u4ec0\u4e48\u4e86\uff1f' with end_pos=12 it
-    computed round(12 * 11 / 29) = 5 and cut five characters, dropping \u73b0 from the
-    result. It also measured that ratio over a *different* segmentation, since it
-    skipped punctuation where _text_to_ipa splits on it.
+    Partial English words can become letter names: ``tw`` has more phones than
+    ``two``. Counting every prefix permanently attributed later words' phones
+    to those incomplete spellings. Only count complete non-CJK words. CJK
+    still needs character boundaries because commands need not contain spaces.
     """
     if not phonemized:
         # One "phoneme" per character, so the mapping is the identity.
         return list(range(start + 1, end + 1))
+    if lang == 'cmn':
+        boundaries = range(start + 1, end + 1)
+    else:
+        boundaries = [start + match.end() for match in _re.finditer(
+            r"\w+(?:['’]\w+)*|[^\w\s]", text[start:end])]
     ends = []
-    for i in range(start + 1, end + 1):
+    for i in boundaries:
         prefix_phones, ok = _segment_phones(text[start:i], lang)
         if not ok:
             break
@@ -390,9 +392,9 @@ def _text_to_ipa(text: str, with_positions: bool = False):
 
     Returns the phoneme list, or ``(phones, char_ends)`` when ``with_positions`` is
     set, where ``char_ends[i]`` is the offset in ``text`` just past the last
-    character that produced ``phones[i]``. Positions cost one phonemize call per
-    character, so they are opt-in — only asr_kws needs them, to find where the wake
-    word ends.
+    word/character boundary that produced ``phones[i]``. Positions cost extra
+    prefix phonemization calls, so they are opt-in — only asr_kws needs them,
+    to find where the wake word ends.
     """
     ipa_seq = []
     char_ends = []
@@ -483,7 +485,7 @@ def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
 
 
 def _text_after_phoneme(text: str, char_ends: list, end_pos: int) -> str:
-    """The text following the phoneme at ``end_pos - 1``, by exact character offset.
+    """The text following the phoneme at ``end_pos - 1``, by mapped text boundary.
 
     ``char_ends`` comes from ``_text_to_ipa(text, with_positions=True)``, so this is
     a lookup rather than the estimate it replaces — and it needs no second
@@ -491,8 +493,8 @@ def _text_after_phoneme(text: str, char_ends: list, end_pos: int) -> str:
     (it skipped punctuation where _text_to_ipa splits on it) and therefore could not
     have agreed with the index it was given.
 
-    The offset is exact for the phoneme, but a phoneme boundary is not always a
-    *word* boundary: espeak does not distribute phonemes evenly over letters, so
+    A phoneme boundary is not always a *word* boundary: espeak does not
+    distribute phonemes evenly over letters, so
     a word the ASR spelled oddly can end one character early. Observed on
     hardware \u2014 "Little fanscy show me around the exhibition hall" matched the
     9-phoneme wake word and cut inside `fanscy`, sending the LLM
@@ -1681,9 +1683,14 @@ class _ASRNode(Node):
             if not self._adapter:
                 return {"state": "error", "message": "ASR adapter not configured"}
             try:
-                return self._start_inner()
+                result = self._start_inner()
+                if result['state'] in ('idle', 'error'):
+                    self._teardown()
+                    self.state = result['state']
+                return result
             except Exception as e:
                 log.error(f"[asr] start failed: {e}", exc_info=True)
+                self._teardown()
                 self.state = "error"
                 return {"state": "error", "message": str(e)}
 
@@ -1703,13 +1710,10 @@ class _ASRNode(Node):
         log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
         self._first_chunk_event = threading.Event()
         self._worker_ready = threading.Event()
-        self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
-        if self._direction_topic:
-            self._direction_sub = self.create_subscription(
-                String, self._direction_topic, self._direction_cb, _LOW_LAT_QOS)
         # A fresh event, not .clear(): the previous worker thread and _audio_cb
         # closures still hold a reference to the old one.
         self._stop_event = threading.Event()
+        self.state = "starting"
         # Start VAD in a child process
         self._pcm_queue = multiprocessing.Queue(maxsize=1000)
         self._utterance_queue = multiprocessing.Queue(maxsize=100)
@@ -1727,10 +1731,18 @@ class _ASRNode(Node):
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
-        self.state = "starting"
+        # A live publisher can invoke the callback as soon as this subscription
+        # exists. Queues, cancellation events and the VAD process must be ready
+        # first; an unstarted Process reports is_alive() == False.
+        self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
+        if self._direction_topic:
+            self._direction_sub = self.create_subscription(
+                String, self._direction_topic, self._direction_cb, _LOW_LAT_QOS)
         log.info("[asr] waiting for first audio chunk...")
         # Block until first audio chunk arrives or stop() cancels (timeout to avoid infinite hang)
         got_chunk = self._first_chunk_event.wait(timeout=10)
+        if self.state == "error":
+            return {"state": "error", "message": "ASR worker failed to initialize (check logs)"}
         if self._stop_event.is_set():
             self.state = "idle"
             return {"state": "idle"}
@@ -1740,6 +1752,9 @@ class _ASRNode(Node):
         self._worker_ready.wait(timeout=5)
         if self.state == "error":
             return {"state": "error", "message": "ASR worker failed to initialize (check logs)"}
+        if self._stop_event.is_set():
+            self.state = "idle"
+            return {"state": "idle"}
         self.state = "running"
         log.info("[asr] started, receiving audio data")
         return self._status_dict()

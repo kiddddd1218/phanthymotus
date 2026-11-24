@@ -314,3 +314,42 @@ def test_a_cut_at_the_very_end_of_the_text_stays_empty():
 
     # Advancing must stop at len(text) rather than run off the end.
     assert asr._text_after_phoneme(text, char_ends, 9) == ""
+
+
+@pytest.mark.parametrize('spelling', ['nights', 'nites'])
+def test_complete_word_boundaries_ignore_partial_letter_names(monkeypatch, spelling):
+    """JP5's real 'tw' has ten phones, but complete 'two' has four.
+
+    The homophone also checks that trimming follows recognized text, not an
+    exact search for the configured wake phrase's spelling.
+    """
+    words = {'for': ['f', 'ɔːɹ'], 'two': ['t', 'uː'],
+             spelling: ['n', 'aɪ', 't', 's'], 'can': ['k', 'æ', 'n'],
+             'i': ['aɪ'], 'check': ['tʃ', 'ɛ', 'k'], 'in': ['ɪ', 'n'],
+             'now': ['n', 'aʊ']}
+    letters = {'t': ['t', 'iː'], 'tw': ['t', 'iː', 'd', 'ʌ', 'b', 'əl', 'j', 'uː']}
+
+    def phonemize(text, lang):
+        tokens = asr._re.findall(r'[a-z]+', text.lower())
+        return ' '.join(p for word in tokens
+                        for p in words.get(word, letters.get(word, list(word))))
+
+    monkeypatch.setattr(asr, '_phonemize_safe', phonemize)
+    text = '- For two ' + spelling + ', can I check in now?'
+    phones, ends = asr._text_to_ipa(text, with_positions=True)
+    matched, end = asr._find_keyword_in_ipa(phones, ['f', 'ɔːɹ', 't', 'uː', 'n', 'aɪ', 't', 's'], .3)
+    assert matched
+    assert asr._text_after_phoneme(text, ends, end) == 'can I check in now?'
+    assert ends[end - 1] == text.index(',')
+
+
+def test_context_pronunciation_change_does_not_swallow_next_word(monkeypatch):
+    """A shorter prefix can change pronunciation even at a word boundary."""
+    recordings = {'read': 'r ɛ d', 'read it': 'r iː d ɪ t',
+                  'read it now': 'r iː d ɪ t n aʊ'}
+    monkeypatch.setattr(asr, '_phonemize_safe',
+                        lambda text, lang: recordings.get(text.strip(), 'r ɛ d'))
+    phones, ends = asr._text_to_ipa('read it now', with_positions=True)
+    assert asr._text_after_phoneme('read it now', ends, 3) == 'it now'
+    assert len(ends) == len(phones)
+    assert ends == sorted(ends)
