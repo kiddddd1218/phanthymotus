@@ -1419,6 +1419,15 @@ class PosePerceptionPlugin:
                 cv2.waitKey = lambda *a, **k: 0
                 cv2.destroyAllWindows = lambda *a, **k: None
 
+            _cpu_onnx = os.environ.get("POSE_CPU_ONNX_PATH", "").strip()
+            if _cpu_onnx:
+                from plugins.pose_cpu_session import PoseCpuSession
+                self._model = PoseCpuSession(_cpu_onnx)
+                log.info(
+                    "pose engine activated: cpu-onnx %s (POSE_CPU_ONNX_PATH set; "
+                    "TRT resolver/slot bypassed, CPU EP, 1 thread)", _cpu_onnx)
+                return
+
             from plugins.vision_runtime import VisionEngineSession
 
             engine_path = self._resolve_engine()
