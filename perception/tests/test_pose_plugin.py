@@ -891,6 +891,72 @@ def test_stop_with_no_instance_running_is_not_an_error():
     assert plugin.dispatch("pose", {"action": "stop"}) == {"state": "idle"}
 
 
+def test_start_while_retiring_auto_starts_without_idle_gap(monkeypatch):
+    """Exact cf422910 sequence: stop times out mid-frame, evaluator calls start
+    once and then only polls info(). The queued start must hold info() at
+    loading until teardown finishes and then transition directly to running."""
+    entered = threading.Event()
+    release = threading.Event()
+    plugin, _ = _plugin()
+    topic = "/benchmark/camera/image/pose_job_0"
+    start = {"action": "start", "input_topic": topic}
+    assert plugin.dispatch("pose", start)["state"] == "running"
+    old = plugin._nodes[topic]
+
+    def slow_frame(*packet):
+        entered.set()
+        release.wait(10)
+
+    try:
+        monkeypatch.setattr(old, "_process_frame", slow_frame)
+        old._image_cb(_FakeCompressedImage(b"frame"))
+        assert entered.wait(2)
+        assert plugin._retire_node(topic, timeout=0.02)["state"] == "stopping"
+        # Evaluator calls start ONCE while retirement is still draining:
+        assert plugin.dispatch("pose", start)["state"] == "loading"
+        # While still retiring, info() must report loading (never idle):
+        assert plugin.dispatch("pose", {"action": "info", "input_topic": topic})["state"] == "loading"
+        release.set()
+        assert _wait_until(
+            lambda: plugin.dispatch("pose", {"action": "info", "input_topic": topic})["state"] == "running"
+        )
+        new = plugin._nodes[topic]
+        assert new is not old and old.destroyed
+    finally:
+        release.set()
+        plugin.shutdown()
+
+
+def test_stop_while_retiring_cancels_queued_auto_start(monkeypatch):
+    """An explicit stop after a queued start must leave the card idle."""
+    entered = threading.Event()
+    release = threading.Event()
+    plugin, _ = _plugin()
+    topic = "/benchmark/camera/image/pose_job_1"
+    start = {"action": "start", "input_topic": topic}
+    assert plugin.dispatch("pose", start)["state"] == "running"
+    old = plugin._nodes[topic]
+
+    def slow_frame(*packet):
+        entered.set()
+        release.wait(10)
+
+    try:
+        monkeypatch.setattr(old, "_process_frame", slow_frame)
+        old._image_cb(_FakeCompressedImage(b"frame"))
+        assert entered.wait(2)
+        assert plugin._retire_node(topic, timeout=0.02)["state"] == "stopping"
+        assert plugin.dispatch("pose", start)["state"] == "loading"
+        assert plugin._retire_node(topic, timeout=0.02)["state"] == "stopping"
+        release.set()
+        assert _wait_until(lambda: old.destroyed and topic not in plugin._retiring)
+        assert plugin.dispatch("pose", {"action": "info", "input_topic": topic})["state"] == "idle"
+        assert plugin._nodes == {}
+    finally:
+        release.set()
+        plugin.shutdown()
+
+
 def test_concurrent_starts_leave_exactly_one_node():
     """The canvas does config→start→stop→start within seconds, from separate
     ThreadingHTTPServer threads."""
@@ -2057,3 +2123,43 @@ def test_a_global_config_call_keeps_the_fall_thresholds():
     assert merged["fall_settle_s"] == 2.5
     assert merged["fall_drop_ratio"] == 0.4
     assert merged["fall_drop_window_s"] == 1.5
+
+
+def test_pose_cpu_session_accepts_square_sizes_and_rejects_bad_shapes(tmp_path):
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+    from plugins.pose_cpu_session import PoseCpuSession
+
+    def _make_dummy_pose_onnx(path, in_shape, out_shape):
+        inp = helper.make_tensor_value_info("images", TensorProto.FLOAT, in_shape)
+        out = helper.make_tensor_value_info("output0", TensorProto.FLOAT, out_shape)
+        zero = helper.make_tensor(
+            "zero_out",
+            TensorProto.FLOAT,
+            out_shape,
+            np.zeros(out_shape, dtype=np.float32).ravel().tolist(),
+        )
+        # Touch input so ORT keeps both input and output live
+        sliced = helper.make_node("ReduceSum", ["images"], ["s_tmp"], keepdims=0)
+        mul = helper.make_node("Mul", ["s_tmp", "zero_scale"], ["s_zero"])
+        zscale = helper.make_tensor("zero_scale", TensorProto.FLOAT, [], [0.0])
+        add = helper.make_node("Add", ["zero_out", "s_zero"], ["output0"])
+        graph = helper.make_graph([sliced, mul, add], "dummy_pose", [inp], [out], [zero, zscale])
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.save(model, str(path))
+
+    for side in (320, 384, 640):
+        p = tmp_path / f"pose_{side}.onnx"
+        _make_dummy_pose_onnx(p, [1, 3, side, side], [1, 300, 57])
+        sess = PoseCpuSession(str(p))
+        assert sess.input_size == (side, side)
+        outs, meta = sess.infer(np.zeros((720, 1280, 3), dtype=np.uint8))
+        assert outs[0].shape == (1, 300, 57)
+        assert (meta.orig_w, meta.orig_h) == (1280, 720)
+        sess.close()
+
+    bad = tmp_path / "pose_bad.onnx"
+    _make_dummy_pose_onnx(bad, [1, 3, 300, 300], [1, 300, 57])
+    with pytest.raises(ValueError, match="need float32"):
+        PoseCpuSession(str(bad))

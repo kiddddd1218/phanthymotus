@@ -599,8 +599,8 @@ RUN python3 -m plugins.darvin_assets /work/config.yaml
 # while building so ten cold workers can start directly from the image.
 RUN python3 -c "from utils.model_downloader import ensure_verified_bundle; \
     ensure_verified_bundle('pose-cpu', '/work/models/pose', \
-    'https://modelscope.ai/models/will4para/darvin314-official126-streaming/resolve/cfe0c7ddb31e4db41c2feff142eeff62d78f2ea3', \
-    {'pose-cpu.onnx': {'size': 20288856, 'sha256': '38974d4514d4bab75e3693407c984ece5fc8db0b0c72e1133a0bb1938798c67a'}})"
+    'https://modelscope.ai/models/will4para/darvin314-official126-streaming/resolve/727f3c2577285cb8a869f2268d48be0d59edbb04', \
+    {'pose-cpu.onnx': {'size': 20087248, 'sha256': 'faf6b664f8a3ed4e04190445b426d4dfc0a73d5b22f4aead557e067d01957543'}})"
 
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────
 # Runs the frontend that was just copied in, on the Python this image actually

@@ -414,9 +414,14 @@ class _PoseNode(Node):
         # scored. "The activity field is empty" is otherwise impossible to tell
         # from "the model was never asked" or "nothing cleared the threshold".
         self._last_prediction: dict = {}
-        self._tracker = PoseTracker(history_s=classifier.history_s,
-                                   min_conf=kpt_confidence,
-                                   label_hold=label_hold)
+        single_official = (self._max_persons == 1
+                           and getattr(classifier, "uses_official_taxonomy", False))
+        self._tracker = PoseTracker(
+            history_s=classifier.history_s,
+            timeout_s=10.0 if single_official else 1.0,
+            centroid_max_travel=4.0 if single_official else 0.8,
+            min_conf=kpt_confidence,
+            label_hold=label_hold)
 
         self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
         self._pub_skeleton = self.create_publisher(String, self._skeleton_topic,
@@ -1175,6 +1180,7 @@ class PosePerceptionPlugin:
 
         self._nodes: dict[str, _PoseNode] = {}
         self._retiring: dict[str, Future] = {}
+        self._pending_starts: dict[str, tuple[str, dict]] = {}
         self._shutting_down = False
         self._instance_configs: dict[str, dict] = {}
         # What the camera feeding each instance said about its optics. `position`
@@ -1786,6 +1792,7 @@ class PosePerceptionPlugin:
         """Bound the MCP wait while retaining ownership until teardown finishes."""
         with self._nodes_lock:
             retirement = self._retiring.get(node_key)
+            self._pending_starts.pop(node_key, None)
             self._upstream_camera.pop(node_key, None)
             node = None
             if retirement is None:
@@ -1840,15 +1847,24 @@ class PosePerceptionPlugin:
                 log_process_memory(log, "pose.warmup_retired")
         except Exception as error:
             log.exception("failed to retire pose instance %s", key)
+            with self._nodes_lock:
+                self._pending_starts.pop(key, None)
             retirement.set_exception(error)
             return
         with self._nodes_lock:
             del self._retiring[key]
+            pending = None if self._shutting_down else self._pending_starts.pop(key, None)
+            if pending is not None:
+                try:
+                    self._start_node(key, pending[0])
+                except Exception:
+                    log.exception("failed to auto-start queued pose instance %s", key)
             retirement.set_result(result)
 
     def shutdown(self):
         with self._nodes_lock:
             self._shutting_down = True
+            self._pending_starts.clear()
             keys = list(self._nodes) + list(self._retiring)
         for key in keys:
             self._retire_node(key, timeout=None)
@@ -1992,6 +2008,7 @@ class PosePerceptionPlugin:
 
         with self._nodes_lock:
             nodes = dict(self._nodes)
+            pending_starts = dict(self._pending_starts)
         instances = {
             key: {
                 "input": node._input_topic,
@@ -2064,7 +2081,7 @@ class PosePerceptionPlugin:
 
         info = {
             **base,
-            "state": "running" if instances else "idle",
+            "state": "running" if instances else ("loading" if pending_starts else "idle"),
             "keypoints": N_KEYPOINTS,
             "keypoint_names": list(COCO_KEYPOINTS),
             "action_backend": self._action_backend,
@@ -2210,7 +2227,14 @@ class PosePerceptionPlugin:
             if self._shutting_down:
                 return {"state": "idle"}
             if node_key in self._retiring:
-                return self._restart_status(node_key)
+                status = self._restart_status(node_key)
+                if status.get("state") == "loading":
+                    if input_topic:
+                        from plugins.camera_info import for_topic as _camera_for_topic
+                        self._upstream_camera[node_key] = _camera_for_topic(
+                            args.get("camera_info"), input_topic)
+                    self._pending_starts[node_key] = (input_topic or "", dict(args))
+                return status
             if input_topic:
                 from plugins.camera_info import for_topic as _camera_for_topic
                 self._upstream_camera[node_key] = _camera_for_topic(

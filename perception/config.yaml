@@ -285,7 +285,7 @@ plugins:
     engine_load_admission_timeout_s: 180
     release_idle_heap: true
     hands: false
-    activity_interval_s: 0.5
+    activity_interval_s: 0.35
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
     # `s` rather than `n`. Keypoint precision is not cosmetic here, it is the
@@ -297,13 +297,11 @@ plugins:
     # need pose, the lever is `enabled`, not a smaller model whose keypoints the
     # rules cannot rely on.
     model: "yolo26s-pose"
-    confidence: 0.4
-    # 12 rather than 5. The geometry judges per frame, but the skeleton-action
-    # model judges a **clip**: a 2.5 s window at 5 fps is 13 real frames
-    # resampled up to the engine's 100, most of it interpolation — and the
-    # frequency of a wave and the speed of a fall live in those frames. Below 12
-    # the card's `info` returns an action_fps_note.
-    fps: 12
+    confidence: 0.30
+    # 24 preserves full temporal fidelity for fast hand/wrist reversals when
+    # frames arrive rapidly; _frame_queue is maxsize=1 (drop-oldest), so slower
+    # CPU workers naturally run at detector speed without queueing backpressure.
+    fps: 24
     # Per-joint visibility threshold. A joint below it takes no part in the
     # rules and is not drawn.
     kpt_confidence: 0.3

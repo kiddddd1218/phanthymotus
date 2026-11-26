@@ -62,6 +62,10 @@ def validate_temporal_calibration(value):
         ms = value.get("maturity_min_scale")
         if type(ms) not in (int, float) or not math.isfinite(ms) or not (0. < ms <= 1.):
             raise ActionBackendError("invalid temporal calibration maturity_min_scale")
+    if "maturity_power" in value:
+        mp = value.get("maturity_power")
+        if type(mp) not in (int, float) or not math.isfinite(mp) or not (0.25 <= mp <= 6.):
+            raise ActionBackendError("invalid temporal calibration maturity_power")
     receipt = value.get("fit_receipt", {})
     if not isinstance(receipt, dict):
         raise ActionBackendError("invalid temporal calibration training receipt")
@@ -254,7 +258,7 @@ class OfficialActionBackend:
                 raise ActionBackendError("temporal calibration receipt path/hash differs")
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             expected_keys = ("history_boundary_s", "early_temperature", "mature_temperature")
-            for opt_key in ("schedule", "maturity_min_scale"):
+            for opt_key in ("schedule", "maturity_min_scale", "maturity_power"):
                 if opt_key in self.temporal_calibration:
                     expected_keys = (*expected_keys, opt_key)
             expected = {key: self.temporal_calibration[key] for key in expected_keys}
@@ -337,7 +341,9 @@ class OfficialActionBackend:
                 activity = self.predict_blob(blob, temperature=temperature) if blob is not None else None
                 min_scale = self.temporal_calibration.get("maturity_min_scale")
                 if activity is not None and min_scale is not None:
-                    maturity = float(min_scale) + (1.0 - float(min_scale)) * min(1.0, max(0.0, span / boundary))
+                    power = float(self.temporal_calibration.get("maturity_power", 1.0))
+                    prog = min(1.0, max(0.0, span / boundary)) ** power
+                    maturity = float(min_scale) + (1.0 - float(min_scale)) * prog
                     activity = dict(activity, score=float(activity["score"]) * maturity)
             else:
                 activity = self.predict_blob(blob) if blob is not None else None
