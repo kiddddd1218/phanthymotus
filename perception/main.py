@@ -793,11 +793,10 @@ def main():
     if executor is not None:
         threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 
-    # A pose-only benchmark has no audio WebSocket service to run.
+    # A pose-only benchmark has no audio WebSocket service or agent-core registry.
     if cfg.get("runtime_profile") != "pose_only":
         threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
-
-    _start_registration(mcp_port, "Perception Stack", "perception")
+        _start_registration(mcp_port, "Perception Stack", "perception")
 
     server = ThreadingHTTPServer(("", mcp_port), make_handler())
     log.info(f"MCP server → http://0.0.0.0:{mcp_port}")

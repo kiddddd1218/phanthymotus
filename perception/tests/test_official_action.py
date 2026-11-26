@@ -215,6 +215,33 @@ class OfficialActionTests(unittest.TestCase):
             with self.assertRaises(ActionBackendError):
                 _OnnxEngine(self.path / 'model.onnx', metadata['taxonomy_sha256'], 'auto')
 
+    def test_linear_time_resample_and_linear_beta_schedule(self):
+        parameters = dict(history_boundary_s=1.5, early_temperature=4.0,
+                          mature_temperature=1.25, schedule='linear_beta',
+                          maturity_min_scale=0.08)
+        receipt = self.path / 'calibration.json'
+        receipt.write_text(json.dumps(dict(fit_split='train', parameters=parameters,
+            engine_sha256=self.manifest['engine']['sha256'])))
+        self.manifest['preprocessing']['resample'] = 'linear_time'
+        self.manifest['temporal_calibration'] = dict(
+            format='darvin-temporal-temperature-v1', **parameters, fit_split='train',
+            fit_receipt=dict(file=receipt.name, sha256=file_hash(receipt)))
+        (self.path / 'artifact.json').write_text(json.dumps(self.manifest))
+        logits = np.zeros((1, 126), np.float32)
+        logits[0, 10] = 8.0
+        backend = OfficialActionBackend(manifest_path=self.path / 'artifact.json',
+                                        window_s=12.0, engine=FakeEngine(logits))
+        f0 = SimpleNamespace(t=0.0, keypoints=self.raw[0], image_size=(640, 480))
+        f_mid = SimpleNamespace(t=0.75, keypoints=self.raw[1], image_size=(640, 480))
+        f_mat = SimpleNamespace(t=1.5, keypoints=self.raw[2], image_size=(640, 480))
+        r0 = backend.classify([f0])
+        rmid = backend.classify([f0, f_mid])
+        rmat = backend.classify([f0, f_mid, f_mat])
+        self.assertAlmostEqual(r0['evidence']['temperature'], 4.0, places=6)
+        self.assertAlmostEqual(rmat['evidence']['temperature'], 1.25, places=6)
+        self.assertLess(r0['activity']['score'], rmid['activity']['score'])
+        self.assertLess(rmid['activity']['score'], rmat['activity']['score'])
+
 
 if __name__ == '__main__':
     unittest.main()

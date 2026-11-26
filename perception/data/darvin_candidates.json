@@ -17,21 +17,21 @@
   },
   "official126_streaming": {
     "backend": "official126",
-    "revision": "96f986d331d1c809bbad185d9013361d1a0c3213",
-    "base_url": "https://modelscope.ai/models/will4para/darvin314-official126-streaming/resolve/96f986d331d1c809bbad185d9013361d1a0c3213",
-    "cache_directory": "official126_streaming-96f986d331d1",
+    "revision": "cfe0c7ddb31e4db41c2feff142eeff62d78f2ea3",
+    "base_url": "https://modelscope.ai/models/will4para/darvin314-official126-streaming/resolve/cfe0c7ddb31e4db41c2feff142eeff62d78f2ea3",
+    "cache_directory": "official126_streaming-cfe0c7ddb31e",
     "files": {
       "action126.onnx": {
-        "size": 5749890,
-        "sha256": "1ca5431952202ee6fac50de32ae16e6ec24674ed0788903e550a26796e48fe54"
+        "size": 6246549,
+        "sha256": "90e8864e55ff7a17d9346d007b0c59d2087e7d978430aa9164856b6a5e59dfcd"
       },
       "artifact.json": {
-        "size": 18141,
-        "sha256": "769b33cc28b9f71e113fa97992d053a8004a4c996099bb574e6ec6685a636c2a"
+        "size": 18128,
+        "sha256": "520104ecd739c05b269675b224d9e424848ae1817e25087d84b51e36bc4c4f82"
       },
       "calibration.json": {
-        "size": 1318,
-        "sha256": "1ba2b8bae93c3c5d29e6a786b8a95040a38d2d9b6e79c4328644ecc2b2f60fe1"
+        "size": 1108,
+        "sha256": "93c01c1f24e4feae24d028111a0ed435cacfb0fe104da80c7a31b9c523d9a7e4"
       }
     }
   }

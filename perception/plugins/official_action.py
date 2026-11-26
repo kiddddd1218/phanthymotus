@@ -5,6 +5,7 @@ space. An artifact declares its backend, exact label order and preprocessing.
 Capture/video time must be supplied by the caller; processing time is not used.
 """
 from collections import deque
+import gc
 import hashlib
 import json
 import logging
@@ -15,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from plugins.pose_stgcn import ActionBackendError, pre_normalize_2d, resample_clip, _nothing
-from utils.runtime_profile import memory_stage
+from utils.runtime_profile import memory_stage, release_idle_heap
 
 INPUT_SHAPE = (1, 2, 100, 17, 3)
 FORMAT = "darvin-official126-v1"
@@ -55,6 +56,12 @@ def validate_temporal_calibration(value):
         if (type(number) not in (int, float) or not math.isfinite(number)
                 or number < lower or number > upper or (key == "history_boundary_s" and number == 0)):
             raise ActionBackendError("invalid temporal calibration parameter: " + key)
+    if value.get("schedule", "step") not in ("step", "linear_beta"):
+        raise ActionBackendError("invalid temporal calibration schedule")
+    if "maturity_min_scale" in value:
+        ms = value.get("maturity_min_scale")
+        if type(ms) not in (int, float) or not math.isfinite(ms) or not (0. < ms <= 1.):
+            raise ActionBackendError("invalid temporal calibration maturity_min_scale")
     receipt = value.get("fit_receipt", {})
     if not isinstance(receipt, dict):
         raise ActionBackendError("invalid temporal calibration training receipt")
@@ -81,6 +88,7 @@ def validate_manifest(manifest):
     preprocessing = manifest.get("preprocessing", {})
     if (preprocessing.get("normalization") not in ("fix", "auto")
             or preprocessing.get("order") != "normalize_then_resample"
+            or preprocessing.get("resample", "index") not in ("index", "linear_time")
             or preprocessing.get("joint_channels") != "COCO17 x/y/confidence"
             or preprocessing.get("person_slots") != "primary_then_zero"):
         raise ActionBackendError("unsupported or absent preprocessing contract")
@@ -96,7 +104,22 @@ def validate_manifest(manifest):
     return labels
 
 
-def pose_blob(keypoints, image_size, normalization="fix"):
+def resample_time_linear(times, clip, wanted=100):
+    """Interpolate normalized (T,17,3) linearly in physical capture timestamps."""
+    n = len(clip)
+    if n == 1 or times[-1] <= times[0] + 1e-9:
+        return np.repeat(clip[:1], wanted, axis=0).astype(np.float32)
+    target_t = np.linspace(float(times[0]), float(times[-1]), wanted)
+    idx = np.searchsorted(times, target_t, side="right") - 1
+    idx = np.clip(idx, 0, n - 2)
+    t0 = times[idx]
+    t1 = times[idx + 1]
+    denom = np.maximum(t1 - t0, 1e-9)
+    w = ((target_t - t0) / denom).astype(np.float32)[:, None, None]
+    return (clip[idx] * (1.0 - w) + clip[idx + 1] * w).astype(np.float32)
+
+
+def pose_blob(keypoints, image_size, normalization="fix", *, times=None, resample="index"):
     """Shared train/inference transform; confidence remains a confidence channel."""
     raw = np.asarray(keypoints, dtype=np.float32)
     if raw.ndim != 3 or raw.shape[1:] != (17, 3) or not len(raw) or not np.isfinite(raw).all():
@@ -105,11 +128,14 @@ def pose_blob(keypoints, image_size, normalization="fix"):
         raise ActionBackendError("joint confidence outside [0,1]")
     normalized = pre_normalize_2d(raw, image_size, normalization)
     result = np.zeros(INPUT_SHAPE, dtype=np.float32)
-    result[0, 0] = resample_clip(normalized, 100)
+    if resample == "linear_time" and times is not None:
+        result[0, 0] = resample_time_linear(np.asarray(times, dtype=np.float64), normalized, 100)
+    else:
+        result[0, 0] = resample_clip(normalized, 100)
     return result
 
 
-def causal_blob(times, keypoints, image_size, now, window_s, normalization="fix"):
+def causal_blob(times, keypoints, image_size, now, window_s, normalization="fix", *, resample="index"):
     """Select only observations in [now-window_s, now], then build the input."""
     times = np.asarray(times, dtype=np.float64)
     raw = np.asarray(keypoints, dtype=np.float32)
@@ -120,7 +146,7 @@ def causal_blob(times, keypoints, image_size, now, window_s, normalization="fix"
     selected = (times >= now - window_s) & (times <= now)
     if not selected.any():
         return None
-    return pose_blob(raw[selected], image_size, normalization)
+    return pose_blob(raw[selected], image_size, normalization, times=times[selected], resample=resample)
 
 
 class CausalWindow:
@@ -162,6 +188,10 @@ class _OnnxEngine:
         options = ort.SessionOptions()
         options.intra_op_num_threads = 1
         options.inter_op_num_threads = 1
+        if hasattr(ort, "ExecutionMode"):
+            options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.enable_cpu_mem_arena = False
+        options.enable_mem_pattern = False
         self.session = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
         inputs, outputs = self.session.get_inputs(), self.session.get_outputs()
         if (len(inputs) != 1 or len(outputs) != 1 or tuple(inputs[0].shape) != INPUT_SHAPE
@@ -195,6 +225,8 @@ class OfficialOnnxSessionCache:
             if self._key != key:
                 with memory_stage(logging.getLogger(__name__), "official126.session_create"):
                     engine = _OnnxEngine(path, taxonomy_hash, normalization)
+                    gc.collect()
+                    release_idle_heap()
                 self._engine, self._key = engine, key
             return self._engine
 
@@ -213,6 +245,7 @@ class OfficialActionBackend:
         if self.engine_path.parent != self.path.parent or file_hash(self.engine_path) != self.manifest["engine"]["sha256"]:
             raise ActionBackendError("engine path/hash differs from the artifact")
         self.normalization = self.manifest["preprocessing"]["normalization"]
+        self.resample = self.manifest["preprocessing"].get("resample", "index")
         self.temporal_calibration = self.manifest.get("temporal_calibration")
         if self.temporal_calibration is not None:
             fit = self.temporal_calibration["fit_receipt"]
@@ -220,8 +253,11 @@ class OfficialActionBackend:
             if receipt_path.parent != self.path.parent or file_hash(receipt_path) != fit["sha256"]:
                 raise ActionBackendError("temporal calibration receipt path/hash differs")
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            expected = {key: self.temporal_calibration[key] for key in
-                        ("history_boundary_s", "early_temperature", "mature_temperature")}
+            expected_keys = ("history_boundary_s", "early_temperature", "mature_temperature")
+            for opt_key in ("schedule", "maturity_min_scale"):
+                if opt_key in self.temporal_calibration:
+                    expected_keys = (*expected_keys, opt_key)
+            expected = {key: self.temporal_calibration[key] for key in expected_keys}
             if (receipt.get("fit_split") != "train" or receipt.get("parameters") != expected
                     or receipt.get("engine_sha256") != self.manifest["engine"]["sha256"]):
                 raise ActionBackendError("temporal calibration parameters differ from fit receipt")
@@ -282,15 +318,27 @@ class OfficialActionBackend:
             if any(size != sizes[-1] for size in sizes):
                 raise ActionBackendError("mixed image sizes in one action history")
             times = [float(f.t) for f in frames]
+            resample_mode = getattr(self, "resample", "index")
             blob = causal_blob(times, [f.keypoints for f in frames], sizes[-1], times[-1],
-                               self.window_s, self.normalization)
+                               self.window_s, self.normalization, resample=resample_mode)
             temperature = 1.
             if self.temporal_calibration is not None:
                 included = [t for t in times if t >= times[-1] - self.window_s]
                 span = included[-1] - included[0]
-                key = "early_temperature" if span < self.temporal_calibration["history_boundary_s"] else "mature_temperature"
-                temperature = self.temporal_calibration[key]
+                boundary = self.temporal_calibration["history_boundary_s"]
+                early_t = self.temporal_calibration["early_temperature"]
+                mature_t = self.temporal_calibration["mature_temperature"]
+                if self.temporal_calibration.get("schedule", "step") == "linear_beta":
+                    alpha = min(1.0, max(0.0, span / boundary))
+                    beta = (1.0 / early_t) + ((1.0 / mature_t) - (1.0 / early_t)) * alpha
+                    temperature = min(20.0, max(1.0, 1.0 / beta))
+                else:
+                    temperature = early_t if span < boundary else mature_t
                 activity = self.predict_blob(blob, temperature=temperature) if blob is not None else None
+                min_scale = self.temporal_calibration.get("maturity_min_scale")
+                if activity is not None and min_scale is not None:
+                    maturity = float(min_scale) + (1.0 - float(min_scale)) * min(1.0, max(0.0, span / boundary))
+                    activity = dict(activity, score=float(activity["score"]) * maturity)
             else:
                 activity = self.predict_blob(blob) if blob is not None else None
             if activity is not None and activity["score"] < self.min_score:

@@ -1421,11 +1421,18 @@ class PosePerceptionPlugin:
 
             _cpu_onnx = os.environ.get("POSE_CPU_ONNX_PATH", "").strip()
             if _cpu_onnx:
+                import gc
                 from plugins.pose_cpu_session import PoseCpuSession
-                self._model = PoseCpuSession(_cpu_onnx)
+                with pose_engine_load_slot(
+                        log, self._plugin_cfg.get("serialize_engine_loads", False)):
+                    self._model = PoseCpuSession(_cpu_onnx)
+                    gc.collect()
+                    if self._plugin_cfg.get("release_idle_heap", False):
+                        release_idle_heap()
                 log.info(
                     "pose engine activated: cpu-onnx %s (POSE_CPU_ONNX_PATH set; "
-                    "TRT resolver/slot bypassed, CPU EP, 1 thread)", _cpu_onnx)
+                    "CPU EP, 1 thread, serialized=%s)",
+                    _cpu_onnx, bool(self._plugin_cfg.get("serialize_engine_loads", False)))
                 return
 
             from plugins.vision_runtime import VisionEngineSession
@@ -1826,6 +1833,8 @@ class PosePerceptionPlugin:
             node.destroy_node()
             del node
             if self._plugin_cfg.get("release_idle_heap", False):
+                import gc
+                gc.collect()
                 release_idle_heap()
             if trace_enabled() and key == "__warmup__":
                 log_process_memory(log, "pose.warmup_retired")

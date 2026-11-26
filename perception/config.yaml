@@ -342,9 +342,9 @@ plugins:
     # single /ws/bus/{topic} for the selected port), so a camera feed and a
     # keypoint feed cannot be combined client-side.
     publish_overlay: false
-    # How far back the action rules look. The frequency of a wave and the
-    # cadence of a walk are both counted inside this window.
-    action_window_s: 2.5
+    # How far back causal action classification retains skeleton frames.
+    # 12.0s preserves full action onset-to-completion context (<30 KiB per track).
+    action_window_s: 12.0
     # ── Action backend ───────────────────────────────────────────────────
     # hybrid (default) = postures from the geometry, activities from the
     #                    ST-GCN++ skeleton-action model
