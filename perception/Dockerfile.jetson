@@ -595,7 +595,7 @@ ARG HAND_SUBNET323_BASE_URL=""
 RUN if [ -n "${HAND_SUBNET323_BASE_URL}" ]; then \
       HAND_SUBNET323_BASE_URL="${HAND_SUBNET323_BASE_URL}" python3 -m plugins.hand_subnet323_assets /work/models/hand_subnet323; \
     else \
-      python3 -m plugins.hand_subnet323_assets /work/models/hand_subnet323; \
+      env -u HAND_SUBNET323_BASE_URL python3 -m plugins.hand_subnet323_assets /work/models/hand_subnet323; \
     fi
 
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────

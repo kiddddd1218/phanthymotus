@@ -8,10 +8,12 @@ Total model files strictly < 30,000,000 bytes (< 30 MB).
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import sys
+import time
 from pathlib import Path
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 # Populated automatically with exact byte sizes & SHA-256 digests after ONNX export
 SUBNET323_MODEL_FILES: Dict[str, Dict[str, object]] = {
@@ -33,10 +35,18 @@ SUBNET323_MODEL_FILES: Dict[str, Dict[str, object]] = {
     },
 }
 
-DEFAULT_SUBNET323_BASE_URL = os.environ.get(
-    "HAND_SUBNET323_BASE_URL",
-    "https://modelscope.cn/models/will4para/darvin323-hand-gesture/resolve/main",
+FALLBACK_SUBNET323_BASE_URL = (
+    "https://github.com/kiddddd1218/phanthymotus/releases/download/darvin323-models-v1"
 )
+DEFAULT_SUBNET323_BASE_URL = FALLBACK_SUBNET323_BASE_URL
+
+
+def resolve_subnet323_base_url(override: Optional[str] = None) -> str:
+    """Resolve non-empty base URL; ignores empty Docker ARG env strings (`""`)."""
+    for candidate in (override, os.environ.get("HAND_SUBNET323_BASE_URL")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return FALLBACK_SUBNET323_BASE_URL
 
 
 def _sha256_path(path: Path) -> str:
@@ -74,20 +84,34 @@ def verify_local_bundle(bundle_dir: Union[str, Path]) -> Dict[str, str]:
     return verified
 
 
-def ensure_subnet323_bundle(bundle_dir: str = "/work/models/hand_subnet323") -> Dict[str, str]:
+def ensure_subnet323_bundle(
+    bundle_dir: str = "/work/models/hand_subnet323",
+    base_url: Optional[str] = None,
+) -> Dict[str, str]:
     root = Path(bundle_dir)
     if all((root / fn).is_file() for fn in SUBNET323_MODEL_FILES):
         return verify_local_bundle(root)
 
     from utils.model_downloader import ensure_verified_bundle
 
-    base_url = os.environ.get("HAND_SUBNET323_BASE_URL", DEFAULT_SUBNET323_BASE_URL)
-    ensure_verified_bundle("hand_subnet323", str(root), base_url, SUBNET323_MODEL_FILES)
-    return verify_local_bundle(root)
+    resolved_url = resolve_subnet323_base_url(base_url)
+    last_err: Optional[Exception] = None
+    for outer_attempt in range(1, 3):
+        try:
+            ensure_verified_bundle("hand_subnet323", str(root), resolved_url, SUBNET323_MODEL_FILES)
+            return verify_local_bundle(root)
+        except Exception as exc:  # noqa: BLE001 — retry once on transient CDN reset
+            last_err = exc
+            if outer_attempt < 2:
+                time.sleep(5)
+    assert last_err is not None
+    raise last_err
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     target = sys.argv[1] if len(sys.argv) > 1 else "/work/models/hand_subnet323"
+    print(f"[hand_subnet323] Ensuring <30 MB ONNX bundle at {target} from {resolve_subnet323_base_url()}")
     paths = ensure_subnet323_bundle(target)
     total = sum(Path(p).stat().st_size for p in paths.values())
     print(f"[hand_subnet323] Verified {len(paths)} ONNX files ({total} bytes < 30,000,000) in {target}")

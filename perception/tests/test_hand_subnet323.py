@@ -23,7 +23,12 @@ from plugins.hand_subnet323 import (
     OFFICIAL_30_CLASSES,
     Subnet323HandRuntime,
 )
-from plugins.hand_subnet323_assets import SUBNET323_MODEL_FILES, verify_local_bundle
+from plugins.hand_subnet323_assets import (
+    FALLBACK_SUBNET323_BASE_URL,
+    SUBNET323_MODEL_FILES,
+    resolve_subnet323_base_url,
+    verify_local_bundle,
+)
 
 PERCEPTION_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = PERCEPTION_DIR.parent
@@ -103,6 +108,25 @@ def test_config_yaml_and_env_ports_hardened_for_8gb_orin():
     # Verify CPU-only ORT invariant so `hand_subnet323.py` can never trigger JP5.11 Provider_SetHost collision
     rt_src = (PERCEPTION_DIR / "plugins" / "hand_subnet323.py").read_text(encoding="utf-8")
     assert "CUDAExecutionProvider" not in rt_src
+
+
+def test_empty_arg_env_falls_back_to_github_release_url(monkeypatch):
+    """Regression test for JP5 Dockerfile ARG HAND_SUBNET323_BASE_URL="" empty-env bug."""
+    assert FALLBACK_SUBNET323_BASE_URL.startswith("https://github.com/kiddddd1218/phanthymotus/releases/download/")
+
+    monkeypatch.delenv("HAND_SUBNET323_BASE_URL", raising=False)
+    assert resolve_subnet323_base_url() == FALLBACK_SUBNET323_BASE_URL
+
+    monkeypatch.setenv("HAND_SUBNET323_BASE_URL", "")
+    assert resolve_subnet323_base_url() == FALLBACK_SUBNET323_BASE_URL
+
+    monkeypatch.setenv("HAND_SUBNET323_BASE_URL", "   ")
+    assert resolve_subnet323_base_url() == FALLBACK_SUBNET323_BASE_URL
+
+    monkeypatch.setenv("HAND_SUBNET323_BASE_URL", "https://example.com/mirror")
+    assert resolve_subnet323_base_url() == "https://example.com/mirror"
+    assert resolve_subnet323_base_url("  ") == "https://example.com/mirror"
+    assert resolve_subnet323_base_url("https://override.example/path") == "https://override.example/path"
 
 
 def test_decode_gestures_two_hand_and_resting_second_hand_guard():

@@ -387,7 +387,7 @@ plugins:
     hand_backend: subnet323_onnx
     hand_interval_s: 0.15
     hand_max_rois: 2
-    image_roots: ["/models", "/tmp", "/work", "/uploads", "/data", "/dataset"]
+    image_roots: ["/models", "/tmp", "/work", "/uploads", "/data", "/dataset", "/home"]
 
   ocr:
     enabled: false
