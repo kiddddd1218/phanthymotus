@@ -286,6 +286,9 @@ plugins:
     release_idle_heap: true
     hands: false
     activity_interval_s: 0.35
+    activity_mode: segment
+    activity_segment_pause_s: 0.16
+    activity_max_unflushed_s: 5.5
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
     # `s` rather than `n`. Keypoint precision is not cosmetic here, it is the

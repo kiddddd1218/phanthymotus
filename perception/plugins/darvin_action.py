@@ -75,6 +75,16 @@ def build_darvin_backend(name, merged, thresholds, *, session_cache=None):
     engine_name = manifest.get("engine", {}).get("file")
     if (engine_name not in spec["files"] or manifest["engine"]["sha256"] != spec["files"][engine_name]["sha256"]):
         raise ActionBackendError("engine identity differs from pinned candidate")
+    rgb_spec = manifest.get("rgb_engine")
+    if isinstance(rgb_spec, dict):
+        rgb_name = rgb_spec.get("file")
+        if rgb_name not in spec["files"] or rgb_spec.get("sha256") != spec["files"][rgb_name]["sha256"]:
+            raise ActionBackendError("rgb engine identity differs from pinned candidate")
+    rtr_spec = manifest.get("multimodal_router")
+    if isinstance(rtr_spec, dict) and isinstance(rtr_spec.get("fit_receipt"), dict):
+        rtr_file = rtr_spec["fit_receipt"].get("file")
+        if rtr_file not in spec["files"] or rtr_spec["fit_receipt"].get("sha256") != spec["files"][rtr_file]["sha256"]:
+            raise ActionBackendError("router receipt identity differs from pinned candidate")
     if spec["backend"] == "official126":
         with memory_stage(log, "official126.init"):
             backend = OfficialActionBackend(manifest_path=paths["artifact.json"],

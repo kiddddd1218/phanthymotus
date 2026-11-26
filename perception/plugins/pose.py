@@ -378,6 +378,10 @@ class _PoseNode(Node):
                  publish_keypoints: str = "off", publish_bbox: bool = True,
                  publish_overlay: bool = False, label_hold: int = 3,
                  activity_interval_s: float = 0.35,
+                 activity_mode: str = "rolling",
+                 activity_segment_pause_s: float = 0.20,
+                 activity_max_unflushed_s: float = 5.5,
+                 segment_backend=None,
                  gesture_tracker: Optional[GestureEventTracker] = None,
                  publish_gesture_events: bool = True,
                  hand_channel=None, publish_hand_keypoints: str = "off",
@@ -409,6 +413,21 @@ class _PoseNode(Node):
         self._frame_interval = 1.0 / max(fps, 0.1)
 
         self._activity_interval_s = float(activity_interval_s)
+        self._activity_mode = str(activity_mode or "rolling")
+        self._activity_segment_pause_s = max(0.05, float(activity_segment_pause_s or 0.20))
+        self._activity_max_unflushed_s = max(0.0, float(activity_max_unflushed_s or 0.0))
+        self._segment_backend = segment_backend
+        self._segment_count = 0
+        if self._segment_backend is not None:
+            from plugins.official_segment import SegmentObservationBuffer
+            self._segment_buffer = SegmentObservationBuffer(
+                quiet_s=self._activity_segment_pause_s,
+                max_s=max(30.0, float(classifier.history_s)),
+                max_patches=16 if getattr(self._segment_backend, "has_rgb", False) else 0,
+                max_ctx_patches=4 if getattr(self._segment_backend, "has_rgb", False) else 0,
+            )
+        else:
+            self._segment_buffer = None
         self._trace_first_action = trace_enabled()
         # Most recent raw model output, so `info` can show what it actually
         # scored. "The activity field is empty" is otherwise impossible to tell
@@ -547,7 +566,14 @@ class _PoseNode(Node):
             self.wait_stopped(None)
             self._worker = None
             self._running = False
+            while True:
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    break
             self._tracker.reset()
+            if self._segment_buffer is not None:
+                self._segment_buffer.reset()
             # Drop gesture state with the tracks it belongs to. Keeping it
             # would mean a restart inherits a held gesture and an armed
             # cooldown from before the stop, so the first real gesture after
@@ -563,7 +589,13 @@ class _PoseNode(Node):
             return self._status()
 
     def _image_cb(self, msg: CompressedImage):
+        stop_ev = getattr(self, "_stop_event", None)
+        if stop_ev is not None and stop_ev.is_set():
+            return
         now = time.monotonic()
+        seg_buf = getattr(self, "_segment_buffer", None)
+        if seg_buf is not None:
+            seg_buf.note_ingress(now)
         stamp = getattr(getattr(msg, "header", None), "stamp", None)
         sec, nsec = getattr(stamp, "sec", None), getattr(stamp, "nanosec", None)
         stamped = (type(sec) is int and type(nsec) is int and sec >= 0
@@ -578,7 +610,7 @@ class _PoseNode(Node):
             return
         self._last_inference_time = now
         self._last_capture_time, self._capture_clock = capture_time, clock
-        queued = (msg.data, capture_time, clock)
+        queued = (msg.data, capture_time, clock, now) if seg_buf is not None else (msg.data, capture_time, clock)
         # Drop the old frame if the queue is full (no backpressure).
         try:
             self._frame_queue.put_nowait(queued)
@@ -592,22 +624,40 @@ class _PoseNode(Node):
             except queue.Full:
                 pass
 
+    def _next_worker_timeout(self) -> float:
+        if self._segment_buffer is not None:
+            return self._segment_buffer.next_timeout_s(time.monotonic(), default_s=0.25)
+        return 1.0
+
     def _inference_worker(self):
         while not self._stop_event.is_set():
             try:
-                packet = self._frame_queue.get(timeout=1.0)
+                packet = self._frame_queue.get(timeout=self._next_worker_timeout())
             except queue.Empty:
+                if self._segment_backend is not None and not self._stop_event.is_set():
+                    try:
+                        self._maybe_flush_segment(force_on_stop=False)
+                    except Exception as error:
+                        log.warning(f"[pose] segment idle flush failed: {error}")
                 continue
             if self._stop_event.is_set():
-                return
+                del packet
+                break
             try:
                 self._process_frame(*packet)
+                if self._segment_backend is not None and not self._stop_event.is_set() and self._frame_queue.empty():
+                    self._maybe_flush_segment(force_on_stop=False)
             except Exception as e:
                 log.error(f"[pose] inference error: {e}", exc_info=True)
             finally:
                 del packet
+        if self._segment_backend is not None:
+            try:
+                self._maybe_flush_segment(force_on_stop=True)
+            except Exception as error:
+                log.warning(f"[pose] segment stop flush failed: {error}")
 
-    def _process_frame(self, jpeg_bytes, capture_time, capture_clock):
+    def _process_frame(self, jpeg_bytes, capture_time, capture_clock, ingress_mono=None):
         """Release the decoded frame and outputs before waiting for the next JPEG."""
         import cv2
         from plugins.vision_runtime import decode_poses
@@ -616,11 +666,74 @@ class _PoseNode(Node):
         frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             return
+        t_pose0 = time.perf_counter()
         outputs, meta = self._model.infer(frame)
         boxes, scores, keypoints = decode_poses(outputs, meta, self._confidence)
+        pose_ms = (time.perf_counter() - t_pose0) * 1000.0
         self._accept_capture_time(capture_time, capture_clock)
+        if self._segment_buffer is not None:
+            rgb_patch = None
+            crop_hw = int(getattr(self._segment_backend, "crop_hw", 0) or 0)
+            if crop_hw > 0:
+                from plugins.official_segment import make_dual_roi_patch
+                rgb_patch = make_dual_roi_patch(
+                    frame, boxes, scores, keypoints, crop_hw=crop_hw, with_ctx=True
+                )
+            self._segment_buffer.record_observation(
+                capture_time,
+                float(ingress_mono if ingress_mono is not None else time.monotonic()),
+                boxes,
+                scores,
+                keypoints,
+                frame.shape[:2],
+                rgb_patch=rgb_patch,
+                pose_ms=pose_ms,
+            )
         persons = self._describe(boxes, scores, keypoints, frame, capture_time)
         self._publish(persons, frame, started)
+
+    def _maybe_flush_segment(self, *, force_on_stop: bool = False) -> None:
+        if self._segment_backend is None or self._segment_buffer is None:
+            return
+        if not force_on_stop and not self._frame_queue.empty():
+            return
+        popped = self._segment_buffer.pop_for_flush(
+            time.monotonic(),
+            max_unflushed_s=self._activity_max_unflushed_s,
+            force_on_stop=force_on_stop,
+        )
+        if popped is None:
+            return
+        records, trigger = popped
+        started = time.perf_counter()
+        result = self._segment_backend.recognize_segment(records, trigger=trigger)
+        infer_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        if result is None:
+            return
+        wh = result["image_wh"]
+        dummy_shape = type("_FrameShape", (), {"shape": (int(wh[1]), int(wh[0]), 3)})()
+        persons = self._describe(
+            result["boxes"],
+            result["scores"],
+            result["keypoints"],
+            dummy_shape,
+            float(records[-1][0]),
+        )
+        evidence = {**result["evidence"], "inference_ms": infer_ms}
+        self._last_prediction = evidence
+        self._segment_count += 1
+        if persons:
+            persons[0]["verdict"] = {
+                **persons[0]["verdict"],
+                "activity": result["activity"],
+                "evidence": evidence,
+            }
+        self._last_actions = {
+            p["id"]: (p["verdict"].get("activity") or {}).get("name")
+                     or p["verdict"].get("posture") or "unknown"
+            for p in persons
+        }
+        self._publish(persons, emit_gestures=False, publish_skeleton=False, count_frame=False)
 
     # ── payload construction ─────────────────────────────────────────────
 
@@ -683,14 +796,18 @@ class _PoseNode(Node):
                 stagger = (track.id % 3) * self._activity_interval_s / 3.0
                 due = (now_wall - track.activity_t) >= (
                     self._activity_interval_s + stagger)
+            if self._segment_backend is not None:
+                due = False
             verdict = dict(self._classifier.classify(
                 list(track.history), want_activity=due))
             if due:
                 track.activity = verdict.get("activity")
                 track.activity_t = now_wall
                 self._last_prediction = verdict.get("evidence") or {}
-            elif track.activity is not None:
+            elif self._segment_backend is None and track.activity is not None:
                 verdict["activity"] = track.activity
+            if self._segment_backend is not None:
+                verdict["activity"] = None
             # Hysteresis, per person, per channel. Every threshold here is a
             # cliff and at the boundaries the raw answer flips on every frame —
             # a label alternating twelve times a second is worse than a stable
@@ -851,8 +968,11 @@ class _PoseNode(Node):
 
     def _publish(self, persons: list, frame=None,
                  started: Optional[float] = None, *,
-                 emit_gestures: bool = True) -> None:
-        self._detect_count += 1
+                 emit_gestures: bool = True,
+                 publish_skeleton: bool = True,
+                 count_frame: bool = True) -> None:
+        if count_frame:
+            self._detect_count += 1
         self._person_count = len(persons)
         payload = {
             "timestamp": time.time(),
@@ -871,29 +991,30 @@ class _PoseNode(Node):
             self._trace_first_action = False
             log_process_memory(log, "first_action_published")
 
-        height, width = ((frame.shape[0], frame.shape[1])
-                         if frame is not None and hasattr(frame, "shape")
-                         else (0, 0))
-        skeleton = {
-            "timestamp": payload["timestamp"],
-            "count": len(persons),
-            # The renderer has no other way to know what the coordinates are
-            # relative to — keypoints are in source-frame pixels.
-            "image_size": [int(width), int(height)],
-            # The payload describes its own layout, which is what lets the
-            # renderer draw 59 keypoints with no frontend change at all —
-            # pose2d.js already prefers a payload-carried table over its copy.
-            "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
-                               if self._hand_channel is not None
-                               else list(COCO_KEYPOINTS)),
-            "skeleton": (merged_skeleton(COCO_SKELETON, N_KEYPOINTS)
-                         if self._hand_channel is not None
-                         else [list(edge) for edge in COCO_SKELETON]),
-            "persons": [self._skeleton_record(p) for p in persons],
-        }
-        skeleton_message = String()
-        skeleton_message.data = json.dumps(skeleton, ensure_ascii=False)
-        self._pub_skeleton.publish(skeleton_message)
+        if publish_skeleton:
+            height, width = ((frame.shape[0], frame.shape[1])
+                             if frame is not None and hasattr(frame, "shape")
+                             else (0, 0))
+            skeleton = {
+                "timestamp": payload["timestamp"],
+                "count": len(persons),
+                # The renderer has no other way to know what the coordinates are
+                # relative to — keypoints are in source-frame pixels.
+                "image_size": [int(width), int(height)],
+                # The payload describes its own layout, which is what lets the
+                # renderer draw 59 keypoints with no frontend change at all —
+                # pose2d.js already prefers a payload-carried table over its copy.
+                "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
+                                   if self._hand_channel is not None
+                                   else list(COCO_KEYPOINTS)),
+                "skeleton": (merged_skeleton(COCO_SKELETON, N_KEYPOINTS)
+                             if self._hand_channel is not None
+                             else [list(edge) for edge in COCO_SKELETON]),
+                "persons": [self._skeleton_record(p) for p in persons],
+            }
+            skeleton_message = String()
+            skeleton_message.data = json.dumps(skeleton, ensure_ascii=False)
+            self._pub_skeleton.publish(skeleton_message)
 
         if emit_gestures:
             self._publish_gesture_events_for(persons, payload["timestamp"])
@@ -1152,6 +1273,12 @@ class PosePerceptionPlugin:
         self._label_hold = int(plugin_cfg.get("label_hold", 3))
         self._activity_interval_s = float(
             plugin_cfg.get("activity_interval_s", 0.35))
+        self._activity_mode = str(os.environ.get("POSE_ACTIVITY_MODE")
+                                  or plugin_cfg.get("activity_mode", "rolling"))
+        self._activity_segment_pause_s = max(0.05, float(
+            plugin_cfg.get("activity_segment_pause_s", 0.20) or 0.20))
+        self._activity_max_unflushed_s = max(0.0, float(
+            plugin_cfg.get("activity_max_unflushed_s", 5.5) or 0.0))
         # Why a temporal backend may be unavailable, kept so `info` can say it
         # instead of the card looking like it chose the geometry on purpose.
         self._backend_fallback: Optional[str] = None
@@ -1223,6 +1350,11 @@ class PosePerceptionPlugin:
             "label_hold": int(icfg.get("label_hold", self._label_hold)),
             "activity_interval_s": float(icfg.get(
                 "activity_interval_s", self._activity_interval_s)),
+            "activity_mode": str(icfg.get("activity_mode", self._activity_mode)),
+            "activity_segment_pause_s": max(0.05, float(icfg.get(
+                "activity_segment_pause_s", self._activity_segment_pause_s) or 0.20)),
+            "activity_max_unflushed_s": max(0.0, float(icfg.get(
+                "activity_max_unflushed_s", self._activity_max_unflushed_s) or 0.0)),
             "publish_gesture_events": bool(icfg.get(
                 "publish_gesture_events", self._publish_gesture_events)),
             "gesture_whitelist": (_gesture_whitelist(icfg["gesture_whitelist"])
@@ -1367,11 +1499,13 @@ class PosePerceptionPlugin:
             # An explicit official artifact must never fall back to another
             # vocabulary, motion gate, fixed fall index or legacy score bar.
             from plugins.official_action import OfficialActionBackend
-            return OfficialActionBackend(
+            backend = OfficialActionBackend(
                 manifest_path=merged["official_action_manifest"],
                 window_s=merged["action_window_s"],
                 min_score=merged["official_action_min_score"],
             )
+            backend._ensure_engine(self._official_onnx_sessions)
+            return backend
         try:
             return build_backend(
                 name,
@@ -1750,11 +1884,19 @@ class PosePerceptionPlugin:
             if node_key in self._nodes:
                 return self._nodes[node_key]._status()
             merged = self._merged_config(node_key)
+            classifier = self._classifier_for(merged)
+            segment_backend = None
+            if (merged.get("activity_mode") == "segment"
+                    and getattr(classifier, "uses_official_taxonomy", False)):
+                from plugins.official_segment import OfficialSegmentMultimodalBackend
+                segment_backend = OfficialSegmentMultimodalBackend(classifier)
+                if segment_backend.has_rgb:
+                    segment_backend._ensure_rgb_engine()
             suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
             node = _PoseNode(
                 input_topic or None, self._model, merged["confidence"],
                 merged["fps"], node_suffix=suffix,
-                classifier=self._classifier_for(merged),
+                classifier=classifier,
                 kpt_confidence=merged["kpt_confidence"],
                 max_persons=merged["max_persons"],
                 publish_keypoints=merged["publish_keypoints"],
@@ -1762,6 +1904,10 @@ class PosePerceptionPlugin:
                 publish_overlay=merged["publish_overlay"],
                 label_hold=merged["label_hold"],
                 activity_interval_s=merged["activity_interval_s"],
+                activity_mode=merged["activity_mode"],
+                activity_segment_pause_s=merged["activity_segment_pause_s"],
+                activity_max_unflushed_s=merged["activity_max_unflushed_s"],
+                segment_backend=segment_backend,
                 gesture_tracker=self._gesture_tracker_for(merged),
                 publish_gesture_events=merged["publish_gesture_events"],
                 hand_channel=self._hand_channel_for(merged),
@@ -2388,6 +2534,12 @@ class PosePerceptionPlugin:
             self._label_hold = int(cfg["label_hold"])
         if "activity_interval_s" in cfg:
             self._activity_interval_s = float(cfg["activity_interval_s"])
+        if "activity_mode" in cfg:
+            self._activity_mode = str(cfg["activity_mode"])
+        if "activity_segment_pause_s" in cfg:
+            self._activity_segment_pause_s = max(0.05, float(cfg["activity_segment_pause_s"]))
+        if "activity_max_unflushed_s" in cfg:
+            self._activity_max_unflushed_s = max(0.0, float(cfg["activity_max_unflushed_s"]))
         for key in _THRESHOLD_KEYS:
             if key in cfg:
                 self._plugin_cfg[key] = cfg[key]

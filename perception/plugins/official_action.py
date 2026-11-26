@@ -105,6 +105,20 @@ def validate_manifest(manifest):
         raise ActionBackendError("invalid explicit engine kind/file/hash")
     if "temporal_calibration" in manifest:
         validate_temporal_calibration(manifest["temporal_calibration"])
+    if "rgb_engine" in manifest and manifest["rgb_engine"] is not None:
+        rgb_eng = manifest["rgb_engine"]
+        rname = rgb_eng.get("file", "") if isinstance(rgb_eng, dict) else ""
+        rdigest = rgb_eng.get("sha256", "") if isinstance(rgb_eng, dict) else ""
+        if (not isinstance(rgb_eng, dict) or rgb_eng.get("kind") != "onnx_cpu"
+                or not rname or Path(rname).name != rname or rname in (".", "..")
+                or len(rdigest) != 64 or any(c not in "0123456789abcdef" for c in rdigest)):
+            raise ActionBackendError("invalid optional rgb_engine specification")
+    if "multimodal_router" in manifest and manifest["multimodal_router"] is not None:
+        rtr = manifest["multimodal_router"]
+        theta = rtr.get("theta") if isinstance(rtr, dict) else None
+        if (not isinstance(rtr, dict) or not isinstance(theta, list) or len(theta) != 10
+                or any(type(v) not in (int, float) or not math.isfinite(v) for v in theta)):
+            raise ActionBackendError("invalid optional multimodal_router theta")
     return labels
 
 
