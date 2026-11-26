@@ -160,6 +160,7 @@ def test_no_standalone_session_is_created_outside_the_worker():
         "ort_worker.py",          # the child itself, which is the point
         "face_runtime.py",        # `_open_session` fallback, warned about
         "kokoro_direct.py",       # `in_process=True` fallback, cpu-only
+        "hand_subnet323.py",      # CPUExecutionProvider-only (<10% GPU budget; never loads CUDA provider)
     }
     offenders = {}
     for path in (PERCEPTION_ROOT / "plugins").rglob("*.py"):

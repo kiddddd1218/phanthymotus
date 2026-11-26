@@ -669,11 +669,15 @@ class _PoseNode(Node):
         # cannot decide one person at a time.
         if self._hand_channel is not None:
             try:
-                self._hand_channel.update(persons, frame, now_wall)
+                if hasattr(self._hand_channel, "populate_persons"):
+                    self._hand_channel.populate_persons(persons, frame, pose_adapter=self._model)
+                else:
+                    self._hand_channel.update(persons, frame, now_wall)
             except Exception as error:  # noqa: BLE001 — never lose the bodies
                 log.warning(f"[pose] hand channel failed: {error}")
 
-        if self._hand_channel is not None and self._hand_gestures:
+        if (self._hand_channel is not None and self._hand_gestures
+                and not hasattr(self._hand_channel, "populate_persons")):
             for person in persons:
                 name_hand_shapes(person, self._hand_gestures)
 
@@ -727,10 +731,15 @@ class _PoseNode(Node):
             # skeleton topic instead.
             record["hands_seen"] = sorted(side for side, value in hands.items()
                                           if value is not None)
-            named = {side: name for side, name
-                     in (person.get("hand_gestures") or {}).items() if name}
-            if named:
-                record["hand_gestures"] = named
+            if "hand_bboxes" in person:
+                record["hand_bboxes"] = person["hand_bboxes"]
+                record["hand_gestures"] = person.get("hand_gestures", {"left": None, "right": None})
+                record["hand_gesture_scores"] = person.get("hand_gesture_scores", {"left": None, "right": None})
+            else:
+                named = {side: name for side, name
+                         in (person.get("hand_gestures") or {}).items() if name}
+                if named:
+                    record["hand_gestures"] = named
             if self._publish_hand_keypoints != "off":
                 detail = (_compact_keypoints
                           if self._publish_hand_keypoints == "compact"
@@ -1056,6 +1065,7 @@ class PosePerceptionPlugin:
                                                         DEFAULT_COOLDOWN_S))
         self._gesture_min_score = float(plugin_cfg.get("gesture_min_score", 0.0))
         self._hands = _hands_enabled(plugin_cfg.get("hands"))
+        self._hand_backend = str(plugin_cfg.get("hand_backend") or "").strip()
         self._hand_interval_s = float(plugin_cfg.get("hand_interval_s", 0.25))
         self._hand_max_rois = int(plugin_cfg.get("hand_max_rois", 2))
         self._hand_min_forearm_px = float(
@@ -1168,20 +1178,31 @@ class PosePerceptionPlugin:
                 merged[key] = self._plugin_cfg[key]
         return merged
 
-    def _ensure_hand_model(self):
-        """Load the hand engine, once, on first use.
+    def _subnet323_bundle_dir(self) -> Optional[str]:
+        if self._hand_backend != "subnet323_onnx":
+            return None
+        return (
+            os.environ.get("HAND_SUBNET323_BUNDLE_DIR")
+            or str(self._plugin_cfg.get("hand_bundle_dir") or "/work/models/hand_subnet323")
+        )
 
-        Separate from `_ensure_model` rather than folded into it: the body
-        engine is what a pose card always needs, the hand engine is what it
-        only sometimes needs, and on an 8 GB Orin already running vop, depth,
-        OCR, ASR and TTS the binding constraint is memory. Folding them would
-        make every pose card pay for a channel most of them have off.
-        """
+    def _ensure_hand_model(self):
+        """Load the hand engine, once, on first use."""
         if self._hand_model is not None:
             return self._hand_model
         with self._hand_model_lock:
             if self._hand_model is not None:
                 return self._hand_model
+            bundle_dir = self._subnet323_bundle_dir()
+            if bundle_dir is not None:
+                from plugins.hand_subnet323 import Subnet323HandRuntime
+                from plugins.hand_subnet323_assets import ensure_subnet323_bundle
+
+                ensure_subnet323_bundle(bundle_dir)
+                self._hand_model = Subnet323HandRuntime(bundle_dir)
+                log.info(f"[pose] loaded Subnet323 ONNX hand runtime from {bundle_dir}")
+                return self._hand_model
+
             from plugins.hand_runtime import HandEngine, assert_simcc
             from utils.model_downloader import ensure_hand_model
             from utils.model_progress import fetch_status
@@ -1194,13 +1215,7 @@ class PosePerceptionPlugin:
             engine_path = next(path for name, path in paths.items()
                                if name.endswith(".engine"))
             log.info(f"[pose] loading hand engine: {engine_path}")
-            # HandEngine, not VisionEngineSession: RTMPose normalises with
-            # ImageNet statistics on an unpadded square crop, and the other
-            # wrapper letterboxes and scales to [0, 1].
             session = HandEngine(engine_path)
-            # Refuse anything that is not a 21-keypoint SimCC head before a
-            # frame reaches it: the two output tensors are identical in shape,
-            # so a wrong engine cannot be detected from the numbers later.
             shape = assert_simcc(session)
             log.info(f"[pose] hand engine loaded: input={session.input_size}, "
                      f"output={shape}, {N_HAND_KEYPOINTS} keypoints")
@@ -1208,14 +1223,7 @@ class PosePerceptionPlugin:
             return self._hand_model
 
     def _hand_channel_for(self, merged: dict):
-        """Build the hand channel for one instance, or None.
-
-        A load failure is recorded and the card continues **without** hands
-        rather than refusing to start. The body channel is what answers "is
-        somebody calling me" and it works at any distance; losing it because a
-        second engine could not be fetched would be the wrong trade. `info`
-        carries the error, so this is not silent.
-        """
+        """Build the hand channel for one instance, or None."""
         if not merged["hands"]:
             return None
         try:
@@ -1226,13 +1234,14 @@ class PosePerceptionPlugin:
                         "hands: %s", error)
             return None
         self._hand_load_error = None
+        if hasattr(session, "populate_persons"):
+            return session
         return HandChannel(
             session,
             max_rois=merged["hand_max_rois"],
             interval_s=merged["hand_interval_s"],
             min_forearm_px=merged["hand_min_forearm_px"],
             min_conf=merged["kpt_confidence"],
-            # The hand detector's own threshold, not the person detector's.
             confidence=merged["hand_confidence"],
             hold_s=merged["hand_hold_s"],
         )
@@ -1321,6 +1330,24 @@ class PosePerceptionPlugin:
                 cv2.imshow = lambda *a, **k: None
                 cv2.waitKey = lambda *a, **k: 0
                 cv2.destroyAllWindows = lambda *a, **k: None
+
+            bundle_dir = self._subnet323_bundle_dir()
+            if bundle_dir is not None or self._model_name == "yolo11n-pose-onnx":
+                from plugins.hand_subnet323 import OnnxPoseEngineAdapter
+                from plugins.hand_subnet323_assets import ensure_subnet323_bundle
+
+                bdir = bundle_dir or (
+                    os.environ.get("HAND_SUBNET323_BUNDLE_DIR")
+                    or str(self._plugin_cfg.get("hand_bundle_dir") or "/work/models/hand_subnet323")
+                )
+                ensure_subnet323_bundle(bdir)
+                pose_onnx = os.path.join(bdir, "person_pose.onnx")
+                log.info(f"[pose] loading Subnet323 ONNX pose model: {pose_onnx}")
+                self._model = OnnxPoseEngineAdapter(pose_onnx)
+                log.info(f"[pose] ONNX pose loaded: {self._model_name} "
+                         f"input={self._model.input_size}, "
+                         f"{N_KEYPOINTS} keypoints")
+                return
 
             from plugins.vision_runtime import VisionEngineSession
 
@@ -1491,10 +1518,14 @@ class PosePerceptionPlugin:
                         for side, value in (person.get("hands") or {}).items()
                         if value is not None}}
                        if merged["hands"] else {}),
-                    **({"hand_gestures": person["hand_gestures"],
-                        "hand_gesture_evidence": person.get(
-                            "hand_gesture_evidence", {})}
-                       if person.get("hand_gestures") else {}),
+                    **({"hand_bboxes": person["hand_bboxes"],
+                        "hand_gestures": person["hand_gestures"],
+                        "hand_gesture_scores": person["hand_gesture_scores"]}
+                       if "hand_bboxes" in person else (
+                           {"hand_gestures": person["hand_gestures"],
+                            "hand_gesture_evidence": person.get(
+                                "hand_gesture_evidence", {})}
+                           if person.get("hand_gestures") else {})),
                 }
                 for person in persons
             ],
@@ -1529,6 +1560,18 @@ class PosePerceptionPlugin:
             self._hand_load_error = str(error)
             return ({"ok": False, "reason": "engine_unavailable",
                      "detail": str(error)}, [])
+        if hasattr(session, "populate_persons"):
+            try:
+                found = session.populate_persons(persons, frame, pose_adapter=self._model)
+            except Exception as error:  # noqa: BLE001 — surface without crashing photo call
+                session.last_error = f"{type(error).__name__}: {error}"
+                return ({"ok": False, "reason": "infer_failed",
+                         "detail": str(error)}, [])
+            note = {"ok": True, "found": found, "ran": session.ran,
+                    "skipped": dict(session.skipped)}
+            if session.last_error:
+                note["infer_error"] = session.last_error
+            return note, []
         channel = HandChannel(
             session,
             # Every hand in the picture: a photo is asked for once and read

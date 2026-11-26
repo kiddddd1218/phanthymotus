@@ -586,7 +586,17 @@ COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/data/      /work/data/
 COPY perception/deploy/    /deploy/
+
+# Download & SHA-256 + byte-size verify the <30 MB Subnet 323 ONNX bundle at build time
+# into /work/models/hand_subnet323 (outside any shared /models host bind-mount).
+ARG HAND_SUBNET323_BASE_URL=""
+RUN if [ -n "${HAND_SUBNET323_BASE_URL}" ]; then \
+      HAND_SUBNET323_BASE_URL="${HAND_SUBNET323_BASE_URL}" python3 -m plugins.hand_subnet323_assets /work/models/hand_subnet323; \
+    else \
+      python3 -m plugins.hand_subnet323_assets /work/models/hand_subnet323; \
+    fi
 
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────
 # Runs the frontend that was just copied in, on the Python this image actually
@@ -690,6 +700,8 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 # One write per log line instead of 8 KB block flushes that can tear a Docker
 # log record mid-write.
 ENV PYTHONUNBUFFERED=1
+# Bound native CPU thread pools so 10 concurrent evaluation workers share an 8 GB Orin cleanly.
+ENV OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 # ANSI colour codes are control bytes; in a non-tty container log they are
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
@@ -699,4 +711,6 @@ CMD ["/bin/bash", "-c", \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      source /etc/dla-fallback.env && \
-     python3 /work/main.py"]
+     exec env HAND_SUBNET323_BUNDLE_DIR=/work/models/hand_subnet323 \
+       MALLOC_ARENA_MAX=2 MALLOC_MMAP_THRESHOLD_=65536 MALLOC_TRIM_THRESHOLD_=65536 \
+       python3 /work/main.py"]

@@ -1,0 +1,12 @@
+{
+  "pose_conf_thresh": 0.22,
+  "hand_det_conf_thresh": 0.24,
+  "hand_det_low_anchor_thresh": 0.14,
+  "temperature_hand": 1.0,
+  "temperature_pair": 1.0,
+  "pair_alpha": 0.6,
+  "pair_threshold": 0.48,
+  "null_logit_bias": 0.0,
+  "min_single_prob": 0.32,
+  "second_hand_min_prob": 0.78
+}
