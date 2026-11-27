@@ -17,29 +17,29 @@
   },
   "official126_streaming": {
     "backend": "official126",
-    "revision": "9aa84fc85da8c546e06c4528d365a8a31c19b4d5",
-    "base_url": "https://modelscope.ai/models/will4para/darvin314-official126-streaming/resolve/9aa84fc85da8c546e06c4528d365a8a31c19b4d5",
-    "cache_directory": "official126_streaming-9aa84fc85da8",
+    "revision": "darvin314-v7-gpu-opensource-20261127",
+    "base_url": "https://github.com/kiddddd1218/phanthymotus/releases/download/darvin314-v7-gpu-opensource-20261127",
+    "cache_directory": "official126_streaming-v7-20261127",
     "files": {
       "action126.onnx": {
-        "size": 3342601,
-        "sha256": "d49ae5bacad77adc3488933f042967c492859e496e553c53aa5b690ea02ddda9"
+        "size": 3504272,
+        "sha256": "7d7927b79eb0f75aa834c45903dc13fa7f2aebe47470db6fc088f18a22337c4f"
       },
       "rgb126.onnx": {
-        "size": 7439205,
-        "sha256": "c9296a3fcdd6ab9554141c19596e920076ba8a6fdd3d3688bf5e053619af57c0"
+        "size": 1714932,
+        "sha256": "6fd40eda94770d7b16674abdd35acb00ee52b17297e67fefa3cd469560785ab1"
       },
       "artifact.json": {
-        "size": 18325,
-        "sha256": "45a061cc13a99a1656d04d420cb917da40b0d7369f815fe6a5ea2a0b95d6950e"
+        "size": 18287,
+        "sha256": "4ccdacecd6738f419f28b93ca5691aee7b780b7541023833874088a58a34bfb6"
       },
       "calibration.json": {
-        "size": 364,
-        "sha256": "1bd6ef381201bbeadb0cd23463e61f561cbfa7263b6ccfbd9b98bf0d40252d84"
+        "size": 363,
+        "sha256": "7c026c9f538698f53d07d2ad195ca5b10933a54a350bdac62bd21727e9c80375"
       },
       "router_calibration.json": {
-        "size": 625,
-        "sha256": "f4983f3c599eb477bb715ca97b5b2be60c64e1176c70aa2ebd925443bd28b280"
+        "size": 766,
+        "sha256": "ca0c80f07de07a0d50f8abb1e4308495d1b942e98a93ed679050cf4cd65d2f82"
       }
     }
   }

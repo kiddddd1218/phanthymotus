@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import gc
 import json
 import logging
 import math
@@ -30,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-from utils.runtime_profile import memory_stage
+from utils.runtime_profile import memory_stage, release_idle_heap
 
 log = logging.getLogger(__name__)
 
@@ -351,6 +352,60 @@ class CudaRuntime:
         self._check(self._lib.cudaStreamDestroy(stream), "cudaStreamDestroy")
 
 
+# ── Shared per-process TensorRT device scratch pool ──────────────────────────
+
+class _SharedDeviceScratchPool:
+    """Process-wide, shape-aware GPU scratch buffer shared by sequential TRT engines.
+
+    On an 8 GB Orin running ten perception workers, allocating one private
+    TensorRT activation workspace per engine wastes tens of MiB per process.
+    Engines constructed with `create_execution_context_without_device_memory()`
+    bind this shared buffer under a single execution lock + CUDA stream sync.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._ptrs: dict[int, int] = {}
+        self._caps: dict[int, int] = {}
+        self._owners: dict[int, CudaRuntime] = {}
+
+    @property
+    def lock(self) -> threading.RLock:
+        return self._lock
+
+    def ensure(self, device_id: int, cuda: CudaRuntime, required_bytes: int) -> tuple[int, int]:
+        required = max(0, int(required_bytes))
+        if required == 0:
+            return 0, 0
+        with self._lock:
+            cur_ptr = self._ptrs.get(device_id, 0)
+            cur_cap = self._caps.get(device_id, 0)
+            if cur_ptr and required <= cur_cap:
+                return cur_ptr, cur_cap
+            if cur_ptr:
+                owner = self._owners.get(device_id) or cuda
+                try:
+                    owner.free(cur_ptr)
+                except Exception:
+                    log.debug("shared TRT scratch free failed on device %d", device_id, exc_info=True)
+                self._ptrs[device_id] = 0
+                self._caps[device_id] = 0
+            new_ptr = cuda.malloc(required)
+            self._ptrs[device_id] = new_ptr
+            self._caps[device_id] = required
+            self._owners[device_id] = cuda
+            log.info("[tensorrt] shared scratch pool device=%d allocated %.2f MiB",
+                     device_id, required / (1024.0 * 1024.0))
+            return new_ptr, required
+
+    def capacity(self, device_id: int = 0) -> int:
+        with self._lock:
+            return int(self._caps.get(device_id, 0))
+
+
+_SHARED_TRT_SCRATCH = _SharedDeviceScratchPool()
+
+
 # ── TensorRT engine ──────────────────────────────────────────────────────────
 
 class TensorRTEngine:
@@ -366,17 +421,20 @@ class TensorRTEngine:
     """
 
     def __init__(self, path: str | Path, *, device_id: int = 0,
-                 primary_input: str | None = None):
+                 primary_input: str | None = None,
+                 share_device_scratch: bool = True):
         with memory_stage(log, "trt.engine_import"):
             import tensorrt as trt
 
         self.path = str(path)
+        self._device_id = int(device_id)
         self._trt = trt
         self._lock = threading.Lock()
         self._cuda: CudaRuntime | None = None
         self._runtime = None
         self._engine = None
         self._context = None
+        self._uses_shared_scratch = False
         self._device_buffers: dict[str, int] = {}
         self._device_capacity: dict[str, int] = {}
         self._active_profile = 0
@@ -396,6 +454,8 @@ class TensorRTEngine:
             with memory_stage(log, "trt.deserialize"):
                 self._engine = self._runtime.deserialize_cuda_engine(serialized)
             del serialized
+            gc.collect()
+            release_idle_heap()
             if self._engine is None:
                 # Overwhelmingly this is a version mismatch: an engine plan is
                 # tied to the exact TensorRT that built it, and the reason it
@@ -413,9 +473,19 @@ class TensorRTEngine:
                     f"expects)."
                 )
             with memory_stage(log, "trt.execution_context"):
-                self._context = self._engine.create_execution_context()
+                if (
+                    share_device_scratch
+                    and hasattr(self._engine, "create_execution_context_without_device_memory")
+                ):
+                    self._context = self._engine.create_execution_context_without_device_memory()
+                    self._uses_shared_scratch = self._context is not None
+                if self._context is None:
+                    self._context = self._engine.create_execution_context()
+                    self._uses_shared_scratch = False
                 if self._context is None:
                     raise TensorRTError(f"failed to create TensorRT context: {self.path}")
+            gc.collect()
+            release_idle_heap()
 
             names = [
                 self._engine.get_tensor_name(index)
@@ -509,6 +579,29 @@ class TensorRTEngine:
             f"TensorRT input shape {tuple(shape)} is outside profiles {ranges} ({self.path})"
         )
 
+    def _required_scratch_bytes(self) -> int:
+        context = self._context
+        engine = self._engine
+        if hasattr(context, "update_device_memory_size_for_shapes"):
+            val = context.update_device_memory_size_for_shapes()
+            if val is not None and int(val) >= 0:
+                return int(val)
+        for attr in ("device_memory_size_v2", "device_memory_size"):
+            val = getattr(engine, attr, None)
+            if val is not None:
+                return int(val() if callable(val) else val)
+        return 0
+
+    def _bind_shared_scratch(self) -> None:
+        if not self._uses_shared_scratch:
+            return
+        needed = self._required_scratch_bytes()
+        ptr, cap = _SHARED_TRT_SCRATCH.ensure(self._device_id, self._cuda, needed)
+        if hasattr(self._context, "set_device_memory_v2"):
+            self._context.set_device_memory_v2(ptr, cap)
+        else:
+            self._context.device_memory = ptr
+
     # ── execution ────────────────────────────────────────────────────────
 
     def infer(self, array: np.ndarray, *, auxiliary_inputs=None) -> list[np.ndarray]:
@@ -528,7 +621,7 @@ class TensorRTEngine:
                     f"auxiliary input {name} shape {value.shape} must be {self.auxiliary_shapes[name]}"
                 )
             auxiliary[name] = value
-        with self._lock:
+        with _SHARED_TRT_SCRATCH.lock, self._lock:
             if self._context is None or self._cuda is None:
                 raise TensorRTError(f"TensorRT engine is closed ({self.path})")
             cuda = self._cuda
@@ -545,6 +638,8 @@ class TensorRTEngine:
                     if not context.set_input_shape(name, value.shape):
                         raise TensorRTShapeError(f"TensorRT rejected auxiliary shape {name}: {value.shape}")
                 self._active_shape = shape
+
+            self._bind_shared_scratch()
 
             outputs: list[np.ndarray] = []
             for name in self.output_names:

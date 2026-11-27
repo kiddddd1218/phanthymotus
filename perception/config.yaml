@@ -271,14 +271,12 @@ plugins:
   pose:
     # Judge workers share /dev/shm. Load one TensorRT body engine at a time.
     serialize_engine_loads: true
-    # JP5 (TensorRT 8) only; ignored on every other family. A cold body-engine
-    # load waits, holding the load lock, until host MemAvailable is at least
-    # this. On JP5, host-wide MemAvailable fell by 1492-1603 MiB per back-to-back
-    # cold load and the host went 5224 -> 585 MiB after three; the fourth
-    # started at 585, dipped to 287, and that run lost a worker to exit 137.
-    # Those are whole-box figures, not one process's footprint. 2400 = one such
-    # drop (1600) + 800 reserve. 0 disables the gate.
-    jp5_engine_load_min_available_mib: 2400
+    # JP5 (TensorRT 8) only; ignored on every other family. With
+    # CUDA_MODULE_LOADING=LAZY + shared TRT scratch + malloc_trim inside the
+    # serialized load lock, each worker settles to ~201-287 MiB container charge
+    # before releasing the lock. 1024 MiB prevents overlapping peak bursts without
+    # starving late workers on 8 GB Orins.
+    jp5_engine_load_min_available_mib: 1024
     # One finite deadline for lock wait + headroom wait. Past it the load fails
     # with an explicit error, nothing allocated, and the next `start` retries.
     # A nonfinite or negative value is a configuration error, not a refusal.
@@ -287,8 +285,8 @@ plugins:
     hands: false
     activity_interval_s: 0.35
     activity_mode: segment
-    activity_segment_pause_s: 0.16
-    activity_max_unflushed_s: 5.5
+    activity_segment_pause_s: 0.14
+    activity_max_unflushed_s: 5.0
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
     # `s` rather than `n`. Keypoint precision is not cosmetic here, it is the
@@ -301,10 +299,9 @@ plugins:
     # rules cannot rely on.
     model: "yolo26s-pose"
     confidence: 0.30
-    # 24 preserves full temporal fidelity for fast hand/wrist reversals when
-    # frames arrive rapidly; _frame_queue is maxsize=1 (drop-oldest), so slower
-    # CPU workers naturally run at detector speed without queueing backpressure.
-    fps: 24
+    # 12 FPS on full 640 TensorRT GPU captures 25-55 crisp frames per clip while
+    # keeping Orin Ampere GPU duty cycle strictly below the 10% cap.
+    fps: 12
     # Per-joint visibility threshold. A joint below it takes no part in the
     # rules and is not drawn.
     kpt_confidence: 0.3

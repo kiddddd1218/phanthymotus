@@ -595,12 +595,13 @@ COPY perception/deploy/    /deploy/
 ENV ACTION_MODEL_DIR=/work/models/action
 RUN python3 -m plugins.darvin_assets /work/config.yaml
 
-# Both JetPack images use the same one-thread CPU detector. Verify its bytes
-# while building so ten cold workers can start directly from the image.
-RUN python3 -c "from utils.model_downloader import ensure_verified_bundle; \
-    ensure_verified_bundle('pose-cpu', '/work/models/pose', \
-    'https://modelscope.ai/models/will4para/darvin314-official126-streaming/resolve/9aa84fc85da8c546e06c4528d365a8a31c19b4d5', \
-    {'pose-cpu.onnx': {'size': 6031895, 'sha256': '738f33167f09b903ad5deb1d7705f3267fd31278d1dae455c7a326be44eed683'}})"
+# Pre-cache the verified full-640 TensorRT pose engine for this JetPack line
+# at build time so ten cold workers load directly from disk without network races.
+ENV POSE_MODEL_DIR=/work/models/pose
+RUN python3 -c "from utils.model_downloader import POSE_MODEL_BUNDLES, ensure_verified_bundle, select_bundle_family; \
+    key = select_bundle_family(POSE_MODEL_BUNDLES, 'jp${JP_VERSION}'); \
+    entry = POSE_MODEL_BUNDLES[key]; \
+    ensure_verified_bundle('pose/' + key, '/work/models/pose', entry['base_url'], entry['files'])"
 
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────
 # Runs the frontend that was just copied in, on the Python this image actually
@@ -716,7 +717,7 @@ CMD ["/bin/bash", "-c", \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      source /etc/dla-fallback.env && \
-     exec env POSE_CPU_ONNX_PATH=/work/models/pose/pose-cpu.onnx \
+     exec env \
        CUDA_MODULE_LOADING=LAZY \
        MALLOC_ARENA_MAX=2 MALLOC_MMAP_THRESHOLD_=65536 MALLOC_TRIM_THRESHOLD_=65536 \
        python3 /work/main.py"]

@@ -572,8 +572,10 @@ class _PoseNode(Node):
                 except queue.Empty:
                     break
             self._tracker.reset()
-            if self._segment_buffer is not None:
-                self._segment_buffer.reset()
+            seg_buf = getattr(self, "_segment_buffer", None)
+            if seg_buf is not None:
+                seg_buf.reset()
+            self._last_segment_activity = None
             # Drop gesture state with the tracks it belongs to. Keeping it
             # would mean a restart inherits a held gesture and an armed
             # cooldown from before the stop, so the first real gesture after
@@ -645,7 +647,7 @@ class _PoseNode(Node):
                 break
             try:
                 self._process_frame(*packet)
-                if self._segment_backend is not None and not self._stop_event.is_set() and self._frame_queue.empty():
+                if self._segment_backend is not None and not self._stop_event.is_set():
                     self._maybe_flush_segment(force_on_stop=False)
             except Exception as e:
                 log.error(f"[pose] inference error: {e}", exc_info=True)
@@ -695,8 +697,6 @@ class _PoseNode(Node):
     def _maybe_flush_segment(self, *, force_on_stop: bool = False) -> None:
         if self._segment_backend is None or self._segment_buffer is None:
             return
-        if not force_on_stop and not self._frame_queue.empty():
-            return
         popped = self._segment_buffer.pop_for_flush(
             time.monotonic(),
             max_unflushed_s=self._activity_max_unflushed_s,
@@ -710,6 +710,7 @@ class _PoseNode(Node):
         infer_ms = round((time.perf_counter() - started) * 1000.0, 2)
         if result is None:
             return
+        self._last_segment_activity = result.get("activity")
         wh = result["image_wh"]
         dummy_shape = type("_FrameShape", (), {"shape": (int(wh[1]), int(wh[0]), 3)})()
         persons = self._describe(
@@ -752,8 +753,12 @@ class _PoseNode(Node):
                 self._gesture_tracker.reset()
             if self._hand_channel is not None:
                 self._hand_channel.reset()
+            seg_buf = getattr(self, "_segment_buffer", None)
+            if seg_buf is not None:
+                seg_buf.reset()
             self._last_prediction = {}
             self._last_actions = {}
+            self._last_segment_activity = None
         self._processed_capture_time, self._processed_capture_clock = timestamp, clock
 
     def _describe(self, boxes, scores, keypoints, frame, now_wall: float) -> list:
@@ -807,7 +812,7 @@ class _PoseNode(Node):
             elif self._segment_backend is None and track.activity is not None:
                 verdict["activity"] = track.activity
             if self._segment_backend is not None:
-                verdict["activity"] = None
+                verdict["activity"] = getattr(self, "_last_segment_activity", None)
             # Hysteresis, per person, per channel. Every threshold here is a
             # cliff and at the boundaries the raw answer flips on every frame —
             # a label alternating twelve times a second is worse than a stable
@@ -1617,10 +1622,16 @@ class PosePerceptionPlugin:
         if configured.endswith(".engine") and os.path.isfile(configured):
             return configured
 
+        prebaked_dir = os.environ.get("POSE_MODEL_DIR", "").strip()
+        if prebaked_dir:
+            prebaked = os.path.join(prebaked_dir, "yolo26s-pose.engine")
+            if os.path.isfile(prebaked):
+                return prebaked
+
         from utils.model_downloader import ensure_pose_model
         from utils.model_progress import fetch_status
 
-        model_dir = os.environ.get("POSE_MODEL_DIR", "/models/pose")
+        model_dir = prebaked_dir or "/models/pose"
         progress_cb, _ = fetch_status(
             lambda text: setattr(self, "_model_load_status", text), DEFAULT_MODEL)
         paths = ensure_pose_model(model_dir, progress_cb=progress_cb)

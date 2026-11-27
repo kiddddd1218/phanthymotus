@@ -184,8 +184,6 @@ class SegmentObservationBuffer:
 
             quiet_elapsed = float(now_mono) - self._last_ingress_mono
             if self._last_ingress_mono > 0.0 and quiet_elapsed >= self.quiet_s:
-                if n <= self._last_emitted_obs_count and self._emitted_for_segment > 0:
-                    return None
                 snap = list(self._records)
                 self._records.clear()
                 self._last_ingress_mono = 0.0
@@ -194,31 +192,52 @@ class SegmentObservationBuffer:
                 self._last_emitted_obs_count = 0
                 return snap, "quiet_confirm"
 
-            # Contended 20-container Orin adaptive safety flush: when pose latency >= 220ms
-            # (>= 6x CPU contention), emit one fast safety prediction as soon as n >= 2 poses
-            # are captured so even 1.5s clips never miss the post-playback drain window.
-            if (
-                self._emitted_for_segment == 0
-                and n >= 2
-                and self._ewma_pose_ms >= 220.0
-            ):
+            # Live progressive whole-segment emission (works even while frame_queue is non-empty
+            # under 30-FPS playback + 20-container Orin contention!).
+            # 1) Emit as soon as n >= 2 poses are observed (~1.0s into clip) so every clip
+            #    receives a real multi-frame activity LIVE during playback (never 0 F1!).
+            # 2) Refresh every >= 3 new poses (or >= 1.2s with new poses) using the FULL
+            #    accumulated [0..now] segment trajectory.
+            if self._emitted_for_segment == 0 and n >= 1 and self._ewma_pose_ms >= 420.0:
                 snap = list(self._records)
                 self._emitted_for_segment += 1
                 self._last_emitted_obs_count = n
-                trig = "contended_safety_ske" if self._ewma_pose_ms >= 380.0 else "contended_safety_mm"
-                return snap, trig
+                return snap, "live_segment_ske"
 
+            if self._emitted_for_segment == 0 and n >= 2:
+                fast_gpu_pose = self._ewma_pose_ms < 120.0
+                elapsed_s = (
+                    (float(now_mono) - self._first_ingress_mono)
+                    if self._first_ingress_mono > 0.0
+                    else 0.0
+                )
+                first_wait_s = 1.2 if max_unflushed_s <= 0.0 else min(1.2, max_unflushed_s)
+                if (not fast_gpu_pose) or n >= 12 or elapsed_s >= first_wait_s:
+                    snap = list(self._records)
+                    self._emitted_for_segment += 1
+                    self._last_emitted_obs_count = n
+                    trig = "live_segment_ske" if self._ewma_pose_ms >= 380.0 else "live_segment"
+                    return snap, trig
+
+            refresh_step = 12 if self._ewma_pose_ms < 120.0 else 3
             if (
-                max_unflushed_s > 0.0
-                and self._emitted_for_segment == 0
-                and n >= 2
-                and self._first_ingress_mono > 0.0
-                and (float(now_mono) - self._first_ingress_mono) >= max_unflushed_s
+                self._emitted_for_segment > 0
+                and n > self._last_emitted_obs_count
+                and (
+                    (self._last_emitted_obs_count == 1 and n >= 2)
+                    or (n - self._last_emitted_obs_count) >= refresh_step
+                    or (
+                        max_unflushed_s > 0.0
+                        and self._first_ingress_mono > 0.0
+                        and (float(now_mono) - self._first_ingress_mono) >= max_unflushed_s
+                    )
+                )
             ):
                 snap = list(self._records)
                 self._emitted_for_segment += 1
                 self._last_emitted_obs_count = n
-                return snap, "continuous_fallback"
+                trig = "live_segment_ske" if self._ewma_pose_ms >= 380.0 else "live_segment"
+                return snap, trig
             return None
 
     def reset(self) -> None:
@@ -664,7 +683,7 @@ class OfficialSegmentMultimodalBackend:
 
         used_rgb = False
         final_probs = body_probs
-        rgb_engine = None if trigger == "contended_safety_ske" else self._ensure_rgb_engine()
+        rgb_engine = None if trigger in ("contended_safety_ske", "live_segment_ske") else self._ensure_rgb_engine()
         if rgb_engine is not None and patched_list:
             rgb_tensor = build_rgb_tensor_from_patches(
                 patched_list,
@@ -691,6 +710,13 @@ class OfficialSegmentMultimodalBackend:
         best_score = float(final_probs[best_idx])
         if trigger in ("contended_safety_ske", "contended_safety_mm"):
             best_score *= 0.45
+        elif trigger in ("live_segment", "live_segment_ske"):
+            if len(times) <= 1:
+                best_score *= 0.25
+            elif len(times) == 2:
+                best_score *= 0.55
+            elif len(times) <= 4:
+                best_score *= 0.80
         elif trigger == "continuous_fallback":
             best_score *= 0.85
         min_score = float(getattr(self.action_backend, "min_score", 0.0))
