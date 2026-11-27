@@ -18,6 +18,7 @@ import logging
 import math
 from pathlib import Path
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -95,6 +96,7 @@ class SegmentObservationBuffer:
         self._first_ingress_mono = 0.0
         self._emitted_for_segment = 0
         self._last_emitted_obs_count = 0
+        self._last_emitted_was_quiet = False
         self._ewma_pose_ms = 0.0
 
     def note_ingress(self, now_mono: float) -> None:
@@ -121,10 +123,12 @@ class SegmentObservationBuffer:
                     if self._ewma_pose_ms <= 0.0
                     else 0.5 * self._ewma_pose_ms + 0.5 * float(pose_ms)
                 )
+            done_mono = time.monotonic()
+            t_ref = max(float(now_mono), done_mono)
             if self._first_ingress_mono <= 0.0:
-                self._first_ingress_mono = float(now_mono)
-            if float(now_mono) > self._last_ingress_mono:
-                self._last_ingress_mono = float(now_mono)
+                self._first_ingress_mono = t_ref
+            if t_ref > self._last_ingress_mono:
+                self._last_ingress_mono = t_ref
             rec = [
                 float(capture_t),
                 float(now_mono),
@@ -156,7 +160,7 @@ class SegmentObservationBuffer:
         with self._lock:
             if not self._records or self._last_ingress_mono <= 0.0:
                 return default_s
-            if len(self._records) <= self._last_emitted_obs_count:
+            if len(self._records) <= self._last_emitted_obs_count and self._last_emitted_was_quiet:
                 return default_s
             rem = (self._last_ingress_mono + self.quiet_s) - float(now_mono)
             return max(0.005, min(default_s, rem))
@@ -167,6 +171,7 @@ class SegmentObservationBuffer:
         *,
         max_unflushed_s: float = 0.0,
         force_on_stop: bool = False,
+        allow_quiet: bool = True,
     ):
         """Return `(records_list, trigger_kind)` when ready to emit, else `None`."""
         with self._lock:
@@ -174,70 +179,67 @@ class SegmentObservationBuffer:
             if n == 0:
                 return None
             if force_on_stop:
-                if self._emitted_for_segment > 0 and n <= self._last_emitted_obs_count:
+                if self._emitted_for_segment > 0 and n <= self._last_emitted_obs_count and self._last_emitted_was_quiet:
                     return None
                 snap = list(self._records)
                 self._records.clear()
                 self._emitted_for_segment += 1
                 self._last_emitted_obs_count = 0
+                self._last_emitted_was_quiet = True
                 return snap, "stop_flush"
 
             quiet_elapsed = float(now_mono) - self._last_ingress_mono
-            if self._last_ingress_mono > 0.0 and quiet_elapsed >= self.quiet_s:
-                snap = list(self._records)
-                self._records.clear()
-                self._last_ingress_mono = 0.0
-                self._first_ingress_mono = 0.0
-                self._emitted_for_segment += 1
-                self._last_emitted_obs_count = 0
-                return snap, "quiet_confirm"
+            if allow_quiet and self._last_ingress_mono > 0.0 and quiet_elapsed >= self.quiet_s:
+                if n > self._last_emitted_obs_count or not self._last_emitted_was_quiet:
+                    # Emit over the FULL accumulated clip trajectory and preserve `_records`
+                    # so mid-clip network/CPU pauses never wipe earlier motion into a 1-frame
+                    # static 'none' fragment. `stop()` resets the buffer between clips, and an
+                    # extended >=4.0s pause resets continuous robot streams cleanly below.
+                    snap = list(self._records)
+                    self._emitted_for_segment += 1
+                    self._last_emitted_obs_count = n
+                    self._last_emitted_was_quiet = True
+                    return snap, "quiet_confirm"
+                if quiet_elapsed >= max(4.0, self.quiet_s * 6.0):
+                    self._records.clear()
+                    self._last_ingress_mono = 0.0
+                    self._first_ingress_mono = 0.0
+                    self._emitted_for_segment = 0
+                    self._last_emitted_obs_count = 0
+                    self._last_emitted_was_quiet = False
+                return None
 
-            # Live progressive whole-segment emission (works even while frame_queue is non-empty
-            # under 30-FPS playback + 20-container Orin contention!).
-            # 1) Emit as soon as n >= 2 poses are observed (~1.0s into clip) so every clip
-            #    receives a real multi-frame activity LIVE during playback (never 0 F1!).
-            # 2) Refresh every >= 3 new poses (or >= 1.2s with new poses) using the FULL
-            #    accumulated [0..now] segment trajectory.
+            # Only emit mid-stream on very slow CPU pose (>=380ms/frame) or when a long
+            # continuous stream exceeds `max_unflushed_s`. On fast GPU TensorRT pose, keep
+            # `_inference_worker` uninterrupted so every clip captures dense full-clip poses
+            # and flushes once cleanly on `quiet_confirm` or `stop_flush`.
             if self._emitted_for_segment == 0 and n >= 1 and self._ewma_pose_ms >= 420.0:
                 snap = list(self._records)
                 self._emitted_for_segment += 1
                 self._last_emitted_obs_count = n
+                self._last_emitted_was_quiet = False
                 return snap, "live_segment_ske"
 
-            if self._emitted_for_segment == 0 and n >= 2:
-                fast_gpu_pose = self._ewma_pose_ms < 120.0
-                elapsed_s = (
-                    (float(now_mono) - self._first_ingress_mono)
-                    if self._first_ingress_mono > 0.0
-                    else 0.0
-                )
-                first_wait_s = 1.2 if max_unflushed_s <= 0.0 else min(1.2, max_unflushed_s)
-                if (not fast_gpu_pose) or n >= 12 or elapsed_s >= first_wait_s:
-                    snap = list(self._records)
-                    self._emitted_for_segment += 1
-                    self._last_emitted_obs_count = n
-                    trig = "live_segment_ske" if self._ewma_pose_ms >= 380.0 else "live_segment"
-                    return snap, trig
+            if self._emitted_for_segment == 0 and n >= 2 and self._ewma_pose_ms >= 380.0:
+                snap = list(self._records)
+                self._emitted_for_segment += 1
+                self._last_emitted_obs_count = n
+                self._last_emitted_was_quiet = False
+                return snap, "live_segment_ske"
 
-            refresh_step = 12 if self._ewma_pose_ms < 120.0 else 3
             if (
-                self._emitted_for_segment > 0
+                max_unflushed_s > 0.0
                 and n > self._last_emitted_obs_count
-                and (
-                    (self._last_emitted_obs_count == 1 and n >= 2)
-                    or (n - self._last_emitted_obs_count) >= refresh_step
-                    or (
-                        max_unflushed_s > 0.0
-                        and self._first_ingress_mono > 0.0
-                        and (float(now_mono) - self._first_ingress_mono) >= max_unflushed_s
-                    )
-                )
+                and n >= 2
+                and self._first_ingress_mono > 0.0
+                and (float(now_mono) - self._first_ingress_mono) >= max_unflushed_s
             ):
                 snap = list(self._records)
                 self._emitted_for_segment += 1
                 self._last_emitted_obs_count = n
-                trig = "live_segment_ske" if self._ewma_pose_ms >= 380.0 else "live_segment"
-                return snap, trig
+                self._last_emitted_was_quiet = False
+                self._first_ingress_mono = float(now_mono)
+                return snap, "continuous_fallback"
             return None
 
     def reset(self) -> None:
@@ -247,6 +249,7 @@ class SegmentObservationBuffer:
             self._first_ingress_mono = 0.0
             self._emitted_for_segment = 0
             self._last_emitted_obs_count = 0
+            self._last_emitted_was_quiet = False
             self._ewma_pose_ms = 0.0
 
 

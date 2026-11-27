@@ -307,6 +307,42 @@ class OfficialSegmentTests(unittest.TestCase):
         self.assertIn("ensure_verified_bundle", recipe)
         self.assertNotIn("POSE_CPU_ONNX_PATH", recipe)
 
+    def test_quiet_confirm_preserves_full_clip_trajectory_without_clearing_buffer(self):
+        body_engine = _FakeBodyEngine(target_idx=0)
+        plugin, _ = _plugin(
+            {
+                "action_backend": "official126",
+                "official_action_manifest": str(self.root / "artifact.json"),
+                "activity_mode": "segment",
+                "activity_segment_pause_s": 0.12,
+                "activity_max_unflushed_s": 12.0,
+                "fps": 24,
+                "max_persons": 1,
+                "label_hold": 1,
+            }
+        )
+        with patch("plugins.official_action._OnnxEngine", return_value=body_engine):
+            plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/pause"})
+            node = plugin._nodes["/cam/pause"]
+            for _ in range(3):
+                node._image_cb(_FakeCompressedImage(frame_bytes()))
+                time.sleep(0.05)
+            assert _wait_until(
+                lambda: node._last_prediction.get("trigger") == "quiet_confirm"
+                and node._last_prediction.get("observations") == 3,
+                timeout=2.0,
+            )
+            # Simulate a mid-clip network pause (> quiet_s) followed by 2 more frames:
+            # buffer must NOT have cleared, so the next flush must see ALL 5 observations!
+            for _ in range(2):
+                node._image_cb(_FakeCompressedImage(frame_bytes()))
+                time.sleep(0.05)
+            assert _wait_until(
+                lambda: node._last_prediction.get("observations") == 5,
+                timeout=2.0,
+            )
+            plugin.dispatch("pose", {"action": "stop"})
+
 
 if __name__ == "__main__":
     unittest.main()

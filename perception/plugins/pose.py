@@ -638,7 +638,7 @@ class _PoseNode(Node):
             except queue.Empty:
                 if self._segment_backend is not None and not self._stop_event.is_set():
                     try:
-                        self._maybe_flush_segment(force_on_stop=False)
+                        self._maybe_flush_segment(force_on_stop=False, allow_quiet=True)
                     except Exception as error:
                         log.warning(f"[pose] segment idle flush failed: {error}")
                 continue
@@ -648,7 +648,7 @@ class _PoseNode(Node):
             try:
                 self._process_frame(*packet)
                 if self._segment_backend is not None and not self._stop_event.is_set():
-                    self._maybe_flush_segment(force_on_stop=False)
+                    self._maybe_flush_segment(force_on_stop=False, allow_quiet=False)
             except Exception as e:
                 log.error(f"[pose] inference error: {e}", exc_info=True)
             finally:
@@ -694,13 +694,14 @@ class _PoseNode(Node):
         persons = self._describe(boxes, scores, keypoints, frame, capture_time)
         self._publish(persons, frame, started)
 
-    def _maybe_flush_segment(self, *, force_on_stop: bool = False) -> None:
+    def _maybe_flush_segment(self, *, force_on_stop: bool = False, allow_quiet: bool = True) -> None:
         if self._segment_backend is None or self._segment_buffer is None:
             return
         popped = self._segment_buffer.pop_for_flush(
             time.monotonic(),
             max_unflushed_s=self._activity_max_unflushed_s,
             force_on_stop=force_on_stop,
+            allow_quiet=allow_quiet,
         )
         if popped is None:
             return

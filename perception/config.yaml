@@ -285,8 +285,8 @@ plugins:
     hands: false
     activity_interval_s: 0.35
     activity_mode: segment
-    activity_segment_pause_s: 0.14
-    activity_max_unflushed_s: 5.0
+    activity_segment_pause_s: 0.40
+    activity_max_unflushed_s: 12.0
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
     # `s` rather than `n`. Keypoint precision is not cosmetic here, it is the
